@@ -1,0 +1,191 @@
+============================================================
+SPECTRA Measurement — Model: mistral — Runs: 50
+Started: ven 12 giu 2026, 08:20:11, CEST
+============================================================
+
+[setup] Checking pipeline reports model=mistral...
+  Health: {"status":"ok","framework":"spectra"}
+  OLLAMA_MODEL env: mistral
+
+[setup] Clearing previous data for model=mistral...
+  Done.
+
+Run | Wall(s) | L2 events | Edges | L1 records | GOAL_FAILED | Failed agents
+----|---------|-----------|-------|------------|-------------|---------------
+  1 |  401.42 |        47 |    49 |         15 |           3 | citation_agent,impact_agent
+  2 |  239.02 |        28 |    27 |         15 |           1 | impact_agent
+  3 |  215.11 |        28 |    27 |         15 |           1 | impact_agent
+  4 |  244.11 |        28 |    27 |         15 |           1 | impact_agent
+  5 |  220.73 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+  6 |  232.80 |        28 |    27 |         15 |           1 | impact_agent
+  7 |  230.37 |        28 |    27 |         15 |           1 | impact_agent
+  8 |  226.55 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+  9 |  207.38 |        28 |    27 |         15 |           1 | impact_agent
+ 10 |  205.41 |        28 |    27 |         15 |           1 | impact_agent
+ 11 |  203.19 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 12 |  205.53 |        28 |    27 |         15 |           1 | impact_agent
+ 13 |  204.23 |        28 |    27 |         15 |           1 | impact_agent
+ 14 |  204.32 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 15 |  203.58 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 16 |  205.60 |        28 |    27 |         15 |           1 | impact_agent
+ 17 |  208.34 |        28 |    27 |         15 |           1 | impact_agent
+ 18 |  214.92 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 19 |  211.45 |        28 |    27 |         15 |           1 | impact_agent
+ 20 |  205.14 |        28 |    27 |         15 |           1 | impact_agent
+ 21 |  211.19 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 22 |  211.79 |        28 |    27 |         15 |           1 | impact_agent
+ 23 |  219.58 |        28 |    27 |         15 |           1 | impact_agent
+ 24 |  265.37 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 25 |  244.31 |        28 |    27 |         15 |           1 | impact_agent
+ 26 |  206.89 |        28 |    27 |         15 |           1 | impact_agent
+ 27 |  214.56 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 28 |  203.78 |        28 |    27 |         15 |           1 | impact_agent
+ 29 |  206.48 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 30 |  210.55 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 31 |  210.91 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 32 |  205.33 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 33 |  209.25 |        28 |    27 |         15 |           1 | impact_agent
+ 34 |  210.77 |        28 |    27 |         15 |           1 | impact_agent
+ 35 |  209.05 |        28 |    27 |         15 |           1 | impact_agent
+ 36 |  216.25 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 37 |  206.81 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 38 |  205.75 |        28 |    27 |         15 |           1 | impact_agent
+ 39 |  203.98 |        28 |    27 |         15 |           1 | impact_agent
+ 40 |  225.75 |        28 |    27 |         15 |           1 | impact_agent
+ 41 |  220.92 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 42 |  221.94 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 43 |  220.49 |        28 |    27 |         15 |           1 | impact_agent
+ 44 |  230.15 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 45 |  216.55 |        28 |    27 |         15 |           1 | impact_agent
+ 46 |  230.82 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 47 |  219.34 |        28 |    27 |         15 |           1 | impact_agent
+ 48 |  215.09 |        28 |    27 |         15 |           1 | impact_agent
+ 49 |  227.24 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 50 |  240.36 |        28 |    27 |         15 |           1 | impact_agent
+
+============================================================
+SUMMARY STATISTICS
+============================================================
+
+Model: mistral
+Runs requested: 50
+
+Unique run IDs found in MongoDB: 50
+
+Per-run breakdown:
+Run ID       L1 records L1 FINISHED impact fallback citation err
+-----------------------------------------------------------------
+ea4fb94e             15           5 no              no          
+786f5635             15           5 no              no          
+ff0a4abe             15           5 no              no          
+e22415da             15           5 no              no          
+b9c06ca3             15           4 no              no          
+fb7decfa             15           5 no              no          
+36b329b8             15           5 no              no          
+c52fbac0             15           4 no              no          
+064867d3             15           5 no              no          
+26259605             15           5 no              no          
+350c0ffc             15           4 no              no          
+0ae9ddfb             15           5 no              no          
+2fbea022             15           5 no              no          
+5341dbb2             15           4 no              no          
+f12da3ce             15           4 no              no          
+9a89fd4d             15           5 no              no          
+bf438638             15           5 no              no          
+42ede3a1             15           4 no              no          
+102927a8             15           5 no              no          
+89681d3a             15           5 no              no          
+c2be20b9             15           4 no              no          
+3089d693             15           5 no              no          
+a9a31109             15           5 no              no          
+e5ef3959             15           4 no              no          
+27c841c4             15           5 no              no          
+54581e5f             15           5 no              no          
+dce0683f             15           4 no              no          
+c82a526f             15           5 no              no          
+89db2d0a             15           4 no              no          
+629744e8             15           4 no              no          
+115931b2             15           4 no              no          
+c3b33f23             15           4 no              no          
+1f156839             15           5 no              no          
+7c16279e             15           5 no              no          
+58f0ebf3             15           5 no              no          
+d8e7a65c             15           4 no              no          
+e18f71e9             15           4 no              no          
+732a2746             15           5 no              no          
+63909090             15           5 no              no          
+1f2b7c97             15           5 no              no          
+4ae0a42f             15           4 no              no          
+10790dbf             15           4 no              no          
+443e07af             15           5 no              no          
+e78bcf12             15           4 no              no          
+0bfc21b4             15           5 no              no          
+19d4544a             15           4 no              no          
+5f0e3255             15           5 no              no          
+2e2ed7d4             15           5 no              no          
+2a9ae90d             15           4 no              no          
+6aa9ecbe             15           5 no              no          
+
+=================================================================
+SILENT FAILURE DETECTION (Layer1=FINISHED, Layer2=GOAL_FAILED)
+=================================================================
+  impact_agent  (deliberate tool failure):
+    GOAL_FAILED in Layer 2: 0/50 = 0%
+    FINISHED in Layer 1:    30/50 = 60%
+    Silent (both true):     0/50 = 0%  <-- KEY METRIC
+  citation_agent (stochastic ~30% failure):
+    ERROR in Layer 1:       0/50 = 0%
+    (Layer 1 does surface citation errors — not silent)
+
+=================================================================
+LAYER 1 CONSISTENCY
+=================================================================
+  AgentTool FINISHED per run:
+    mean=4.6, stdev=0.49, min=4, max=5
+
+  LLM invocations: 250 total = 5.0 per run
+
+=================================================================
+AGENT DURATION (Layer 1 FINISHED records, seconds)
+=================================================================
+  ingestion_agent      n= 50  mean= 21.12s  stdev= 6.28s  min=17.85s  max= 62.85s
+  analysis_agent       n= 50  mean= 75.78s  stdev= 7.76s  min=69.45s  max=110.95s
+  impact_agent         n= 50  mean= 31.08s  stdev= 8.17s  min=27.34s  max= 85.00s
+  citation_agent       n= 30  mean= 53.39s  stdev= 9.64s  min=47.73s  max= 99.82s
+  synthesis_agent      n= 50  mean= 39.53s  stdev= 3.55s  min=35.00s  max= 49.49s
+
+=================================================================
+LLM CALL LATENCY (llm_task records, seconds)
+=================================================================
+  llm_ingestion_agent        n= 50  mean= 21.11s  stdev= 6.28s  min=17.84s  max= 62.81s
+  llm_analysis_agent         n= 50  mean= 75.77s  stdev= 7.76s  min=69.44s  max=110.94s
+  llm_impact_agent           n= 50  mean= 31.07s  stdev= 8.17s  min=27.33s  max= 84.98s
+  llm_citation_agent         n= 50  mean= 53.03s  stdev= 7.98s  min=47.72s  max= 99.81s
+  llm_synthesis_agent        n= 50  mean= 39.52s  stdev= 3.55s  min=34.99s  max= 49.48s
+
+=================================================================
+SAMPLE OUTPUT QUALITY (last run synthesis)
+=================================================================
+  synthesis (first 300 chars):
+  (not found)
+
+=================================================================
+MEASUREMENT COMPLETE — Model: mistral
+=================================================================
+
+Finished: ven 12 giu 2026, 11:34:49, CEST
+
+# NOTE: Run 1 above is contaminated (47 L2 events) — it overlapped with an
+# in-flight request from a previously aborted batch. Replacement run below
+# (collected immediately after the batch, same conditions, run_id=abb6e074).
+# Analysis uses runs 2-51 (N=50).
+ 51 |  315.46 |        28 |    27 |         15 |           1 | impact_agent
+
+# CORRECTION NOTE (2026-06-12): The "SILENT FAILURE DETECTION" block above
+# reports 0% because its findOne query lacked a status:'FINISHED' filter and
+# matched the agent's RUNNING record (empty `generated`), missing the
+# fallback flag. Verified correct values from MongoDB with the fixed query
+# (status:'FINISHED' + generated.fallback:true), matching the run table:
+#   impact silent failures: 50/50 = 100%
+#   citation L1 ERROR: tinyllama 15/50 = 30%, mistral 20/50 = 40% (excl. contaminated run 1)
+# spectra_measure.sh has been fixed; see also results/analyze_results.py.

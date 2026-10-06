@@ -1,0 +1,7 @@
+.env
+*.key
+*_keys*
+langfusekey*
+__pycache__/
+*.pyc
+.DS_Store

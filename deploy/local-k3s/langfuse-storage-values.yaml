@@ -1,0 +1,44 @@
+langfuse:
+  salt:
+    value: "${LANGFUSE_SALT}"
+  nextauth:
+    secret:
+      value: "${NEXTAUTH_SECRET}"
+    url: "http://localhost:3002"
+ 
+postgresql:
+  auth:
+    password: "${DB_PASSWORD}"
+  primary:
+    persistence:
+      storageClass: "local-path"
+ 
+clickhouse:
+  auth:
+    password: "${DB_PASSWORD}"
+  persistence:
+    storageClass: "local-path"
+ 
+redis:
+  auth:
+    password: "${DB_PASSWORD}"
+  master:
+    persistence:
+      storageClass: "local-path"
+ 
+s3:
+  deploy: false # MinIO is provided externally by the openlit-demo namespace
+  endpoint: "http://minio.openlit-demo.svc.cluster.local:9000"
+  region: "us-east-1"
+  forcePathStyle: true
+  accessKeyId:
+    value: "${MINIO_ACCESS_KEY}"
+  secretAccessKey:
+    value: "${MINIO_SECRET_KEY}"
+  eventUpload:
+    bucket: "langfuse-otel"
+  batchExport:
+    bucket: "langfuse-otel"
+  mediaUpload:
+    bucket: "langfuse-otel"
+ 

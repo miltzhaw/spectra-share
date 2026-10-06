@@ -1,0 +1,187 @@
+============================================================
+SPECTRA Measurement — Model: llama3.1:8b — Runs: 50
+Started: ven 12 giu 2026, 15:31:07, CEST
+============================================================
+
+[env] Measurement environment:
+  Kube context:   robopaas
+  Ollama node:    gpu-3
+  Ollama GPU:     NVIDIA A30, 192 MiB, 0 %
+  Ollama limits:  {"cpu":"8","memory":"24Gi"}
+  Ollama models:  tinyllama:latest qwen2.5:32b llama3.1:8b mistral:latest
+
+[setup] Checking pipeline reports model=llama3.1:8b...
+  Health: {"status":"ok","framework":"spectra"}
+  Live pod: spectra-pipeline-54d755f6c7-qqz7v
+  OLLAMA_MODEL (live pod): llama3.1:8b
+
+[setup] Clearing previous data for model=llama3.1:8b...
+  Done.
+
+Run | Wall(s) | L2 events | Edges | L1 records | GOAL_FAILED | Failed agents
+----|---------|-----------|-------|------------|-------------|---------------
+  1 |   44.35 |        28 |    27 |         15 |           1 | impact_agent
+    [verified: ollama ps shows llama3.1:8b loaded]
+  2 |    8.99 |        28 |    27 |         15 |           1 | impact_agent
+  3 |    9.64 |        28 |    27 |         15 |           1 | impact_agent
+  4 |   10.14 |        28 |    27 |         15 |           1 | impact_agent
+  5 |   10.28 |        28 |    27 |         15 |           1 | impact_agent
+  6 |   10.05 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+  7 |   10.20 |        28 |    27 |         15 |           1 | impact_agent
+  8 |   10.16 |        28 |    27 |         15 |           1 | impact_agent
+  9 |   10.17 |        28 |    27 |         15 |           1 | impact_agent
+ 10 |   10.11 |        28 |    27 |         15 |           1 | impact_agent
+ 11 |   10.07 |        28 |    27 |         15 |           1 | impact_agent
+ 12 |   10.16 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 13 |    9.96 |        28 |    27 |         15 |           1 | impact_agent
+ 14 |   10.21 |        28 |    27 |         15 |           1 | impact_agent
+ 15 |   10.21 |        28 |    27 |         15 |           1 | impact_agent
+ 16 |   10.08 |        28 |    27 |         15 |           1 | impact_agent
+ 17 |   10.33 |        28 |    27 |         15 |           1 | impact_agent
+ 18 |   10.21 |        28 |    27 |         15 |           1 | impact_agent
+ 19 |   10.27 |        28 |    27 |         15 |           1 | impact_agent
+ 20 |   10.26 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 21 |   10.16 |        28 |    27 |         15 |           1 | impact_agent
+ 22 |   10.12 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 23 |   10.07 |        28 |    27 |         15 |           1 | impact_agent
+ 24 |   10.11 |        28 |    27 |         15 |           1 | impact_agent
+ 25 |   10.20 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 26 |   10.17 |        28 |    27 |         15 |           1 | impact_agent
+ 27 |   10.27 |        28 |    27 |         15 |           1 | impact_agent
+ 28 |   10.26 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 29 |   10.25 |        28 |    27 |         15 |           1 | impact_agent
+ 30 |   10.46 |        28 |    27 |         15 |           1 | impact_agent
+ 31 |   10.41 |        28 |    27 |         15 |           1 | impact_agent
+ 32 |   10.36 |        28 |    27 |         15 |           1 | impact_agent
+ 33 |   10.42 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 34 |   10.15 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 35 |   10.33 |        28 |    27 |         15 |           1 | impact_agent
+ 36 |   10.44 |        28 |    27 |         15 |           1 | impact_agent
+ 37 |   10.65 |        28 |    27 |         15 |           1 | impact_agent
+ 38 |   10.65 |        28 |    27 |         15 |           1 | impact_agent
+ 39 |   10.47 |        28 |    27 |         15 |           1 | impact_agent
+ 40 |   10.33 |        28 |    27 |         15 |           1 | impact_agent
+ 41 |   10.25 |        28 |    27 |         15 |           1 | impact_agent
+ 42 |   10.08 |        28 |    27 |         15 |           1 | impact_agent
+ 43 |   10.29 |        27 |    26 |         15 |           2 | citation_agent,impact_agent
+ 44 |   10.15 |        28 |    27 |         15 |           1 | impact_agent
+ 45 |   10.35 |        28 |    27 |         15 |           1 | impact_agent
+ 46 |   10.25 |        28 |    27 |         15 |           1 | impact_agent
+ 47 |   10.27 |        28 |    27 |         15 |           1 | impact_agent
+ 48 |   10.28 |        28 |    27 |         15 |           1 | impact_agent
+ 49 |   10.42 |        28 |    27 |         15 |           1 | impact_agent
+ 50 |   10.42 |        28 |    27 |         15 |           1 | impact_agent
+
+============================================================
+SUMMARY STATISTICS
+============================================================
+
+Model: llama3.1:8b
+Runs requested: 50
+
+Unique run IDs found in MongoDB: 50
+
+Per-run breakdown:
+Run ID       L1 records L1 FINISHED impact fallback citation err
+-----------------------------------------------------------------
+dc63e31e             15           5 YES             no          
+e8f17dd9             15           5 YES             no          
+8c837743             15           5 YES             no          
+92da71c0             15           5 YES             no          
+bc81a5e0             15           5 YES             no          
+a1787f2b             15           4 YES             YES         
+4068121b             15           5 YES             no          
+cfedc6fd             15           5 YES             no          
+5dc8eb50             15           5 YES             no          
+bd5de916             15           5 YES             no          
+02b27080             15           5 YES             no          
+1d3503d1             15           4 YES             YES         
+9b9934df             15           5 YES             no          
+5a74486e             15           5 YES             no          
+608ed36a             15           5 YES             no          
+723e0b14             15           5 YES             no          
+5e92567e             15           5 YES             no          
+96929fc6             15           5 YES             no          
+c66873bd             15           5 YES             no          
+492a1fcc             15           4 YES             YES         
+07d944b4             15           5 YES             no          
+7cdcd93f             15           4 YES             YES         
+82573427             15           5 YES             no          
+d9fb9c10             15           5 YES             no          
+ed338133             15           4 YES             YES         
+10369413             15           5 YES             no          
+0142dd58             15           5 YES             no          
+857d4f79             15           4 YES             YES         
+a706c12c             15           5 YES             no          
+92a8d104             15           5 YES             no          
+b4a81590             15           5 YES             no          
+f7148bd4             15           5 YES             no          
+5a651ab0             15           4 YES             YES         
+9e138b79             15           4 YES             YES         
+44ae06ac             15           5 YES             no          
+a6be0745             15           5 YES             no          
+5e0a2abc             15           5 YES             no          
+b1fa2ac2             15           5 YES             no          
+fb18fb82             15           5 YES             no          
+299adaa0             15           5 YES             no          
+b4c68102             15           5 YES             no          
+927b3515             15           5 YES             no          
+cfe9570d             15           4 YES             YES         
+0f626d11             15           5 YES             no          
+0cfffa6b             15           5 YES             no          
+d17223de             15           5 YES             no          
+7938f94d             15           5 YES             no          
+e2d9c159             15           5 YES             no          
+6db4542a             15           5 YES             no          
+97ffa990             15           5 YES             no          
+
+=================================================================
+SILENT FAILURE DETECTION (Layer1=FINISHED, Layer2=GOAL_FAILED)
+=================================================================
+  impact_agent  (deliberate tool failure):
+    GOAL_FAILED, run log (L2):    50/50 = 100%
+    fallback=true, MongoDB (L2):  50/50 = 100%
+    FINISHED in Layer 1:          41/50 = 82% (all 5 agents)
+    Silent (impact L1=FINISHED & L2 fallback): 50/50 = 100%  <-- KEY METRIC
+  citation_agent (stochastic ~30% failure by design):
+    GOAL_FAILED, run log (L2):    9/50 = 18%
+    ERROR in Layer 1 (MongoDB):   9/50 = 18%
+    (Layer 1 does surface citation errors — not silent)
+
+=================================================================
+LAYER 1 CONSISTENCY
+=================================================================
+  AgentTool FINISHED per run:
+    mean=4.8, stdev=0.39, min=4, max=5
+
+  LLM invocations: 250 total = 5.0 per run
+
+=================================================================
+AGENT DURATION (Layer 1 FINISHED records, seconds)
+=================================================================
+  ingestion_agent      n= 50  mean=  2.30s  stdev= 4.81s  min= 1.53s  max= 35.66s
+  analysis_agent       n= 50  mean=  1.96s  stdev= 0.06s  min= 1.72s  max=  2.06s
+  impact_agent         n= 50  mean=  2.76s  stdev= 0.28s  min= 1.50s  max=  2.94s
+  citation_agent       n= 41  mean=  1.75s  stdev= 0.13s  min= 1.65s  max=  2.49s
+  synthesis_agent      n= 50  mean=  1.96s  stdev= 0.12s  min= 1.78s  max=  2.63s
+
+=================================================================
+LLM CALL LATENCY (llm_task records, seconds)
+=================================================================
+  llm_ingestion_agent        n= 50  mean=  2.26s  stdev= 4.76s  min= 1.50s  max= 35.25s
+  llm_analysis_agent         n= 50  mean=  1.93s  stdev= 0.06s  min= 1.69s  max=  2.03s
+  llm_impact_agent           n= 50  mean=  2.73s  stdev= 0.28s  min= 1.47s  max=  2.92s
+  llm_citation_agent         n= 50  mean=  1.72s  stdev= 0.11s  min= 1.63s  max=  2.45s
+  llm_synthesis_agent        n= 50  mean=  1.93s  stdev= 0.12s  min= 1.76s  max=  2.60s
+
+=================================================================
+SAMPLE OUTPUT QUALITY (last run synthesis)
+=================================================================
+  synthesis (first 300 chars):
+  (not found)
+
+=================================================================
+MEASUREMENT COMPLETE — Model: llama3.1:8b
+=================================================================
+
+Finished: ven 12 giu 2026, 15:48:13, CEST

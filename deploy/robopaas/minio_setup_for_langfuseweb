@@ -1,0 +1,88 @@
+The deployment of MinIO is exactly what your local cluster environment needs to satisfy Langfuse's storage architecture.
+
+To bridge the gap between Langfuse Web and your newly created MinIO instance, you need to execute two final integration steps: create the destination bucket inside MinIO, and tell Langfuse how to connect to it.
+
+Step 1: Create the langfuse Bucket inside MinIO
+Before the web app can upload trace JSON payloads, the target bucket must explicitly exist on the MinIO server. You can provision this immediately via a quick, temporary Kubernetes job pod:
+
+Bash
+kubectl run minio-setup --rm -i --restart=Never \
+  --namespace=openlit-demo \
+  --image=minio/mc \
+  --command -- sh -c '
+    mc alias set myminio http://minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY";
+    mc mb myminio/langfuse;
+    mc policy set public myminio/langfuse;
+    echo "Bucket successfully created!";
+  '
+Step 2: Bind Langfuse to MinIO
+Since you deployed Langfuse using Helm into the langfuse namespace, create a local override file named langfuse-storage-values.yaml containing the networking paths pointing to your openlit-demo namespace:
+
+YAML
+# langfuse-storage-values.yaml
+env:
+  # Instruct Langfuse to stop defaulting to AWS cloud validation rules
+  LANGFUSE_STORAGE_PROVIDER: "s3"
+  
+  # Connection keys matching your MinIO environmental credentials
+  AWS_ACCESS_KEY_ID: "langfuse"
+  AWS_SECRET_ACCESS_KEY: "${MINIO_SECRET_KEY}"
+  AWS_REGION: "us-east-1"
+  
+  # Core tracking references
+  LANGFUSE_S3_BUCKET: "langfuse"
+  
+  # Cross-Namespace DNS link routing back to your MinIO Service endpoint
+  LANGFUSE_S3_ENDPOINT: "http://minio.openlit-demo.svc.cluster.local:9000"
+  
+  # Vital override: forces traditional path style structure (http://endpoint/bucket) 
+  # instead of cloud subdomains (http://bucket.endpoint)
+  LANGFUSE_S3_FORCE_PATH_STYLE: "true"
+Apply the values to your active Helm setup using an upgrade patch:
+
+Bash
+helm upgrade langfuse langfuse/langfuse \
+  --namespace langfuse \
+  --reuse-values \
+  -f langfuse-storage-values.yaml
+If you installed Langfuse manually through a standard deployment file rather than Helm, append those exact six env name/value pairs into the containers.env array of your langfuse-web deployment file and execute:
+
+Bash
+kubectl rollout restart deployment langfuse-web -n langfuse
+
+
+
+kubectl patch deployment langfuse-web -n langfuse --type='json' -p='[
+  {"op": "add", "path": "/spec/template/spec/containers/0/env", "value": [
+    {"name": "LANGFUSE_STORAGE_PROVIDER", "value": "s3"},
+    {"name": "AWS_ACCESS_KEY_ID", "value": "langfuse"},
+    {"name": "AWS_SECRET_ACCESS_KEY", "value": "${MINIO_SECRET_KEY}"},
+    {"name": "AWS_REGION", "value": "us-east-1"},
+    {"name": "LANGFUSE_S3_BUCKET", "value": "langfuse"},
+    {"name": "LANGFUSE_S3_ENDPOINT", "value": "http://minio.openlit-demo.svc.cluster.local:9000"},
+    {"name": "LANGFUSE_S3_FORCE_PATH_STYLE", "value": "true"},
+    {"name": "NEXT_PUBLIC_LANGFUSE_S3_BUCKET", "value": "langfuse"},
+    {"name": "NEXT_PUBLIC_LANGFUSE_STORAGE_PROVIDER", "value": "s3"}
+  ]}
+]'
+
+
+
+
+
+
+
+kubectl patch deployment langfuse-worker -n langfuse --type='json' -p='[
+  {"op": "add", "path": "/spec/template/spec/containers/0/env", "value": [
+    {"name": "LANGFUSE_STORAGE_PROVIDER", "value": "s3"},
+    {"name": "AWS_ACCESS_KEY_ID", "value": "langfuse"},
+    {"name": "AWS_SECRET_ACCESS_KEY", "value": "${MINIO_SECRET_KEY}"},
+    {"name": "AWS_REGION", "value": "us-east-1"},
+    {"name": "LANGFUSE_S3_BUCKET", "value": "langfuse"},
+    {"name": "LANGFUSE_S3_ENDPOINT", "value": "http://minio.openlit-demo.svc.cluster.local:9000"},
+    {"name": "LANGFUSE_S3_FORCE_PATH_STYLE", "value": "true"},
+    {"name": "NEXT_PUBLIC_LANGFUSE_S3_BUCKET", "value": "langfuse"},
+    {"name": "NEXT_PUBLIC_LANGFUSE_STORAGE_PROVIDER", "value": "s3"}
+  ]}
+]'
+

@@ -1,0 +1,47 @@
+# langfuse-storage-values.yaml
+
+langfuse:
+  salt:
+    value: "${LANGFUSE_SALT}"
+  nextauth:
+    secret:
+      value: "${NEXTAUTH_SECRET}"
+    url: "http://localhost:3002"
+
+postgresql:
+  auth:
+    password: "${DB_PASSWORD}"
+
+clickhouse:
+  auth:
+    password: "${DB_PASSWORD}"          
+
+redis:
+  auth:
+    password: "${DB_PASSWORD}"
+    
+s3:
+  enabled: false
+  endpoint: "http://minio.openlit-demo.svc.cluster.local:9000"
+  region: "us-east-1"
+  forcePathStyle: true
+  
+  # ── CRITICAL FIX: Wrap strings inside the chart's expected dictionary template structure ──
+  accessKeyId:
+    value: "${MINIO_ACCESS_KEY}"
+    secretKeyRef: {}
+  secretAccessKey:
+    value: "${MINIO_SECRET_KEY}"
+    secretKeyRef: {}
+    
+  # Telemetry targets
+  eventUpload:
+    bucket: "langfuse-otel"
+  batchExport:
+    bucket: "langfuse-otel"
+  mediaUpload:
+    bucket: "langfuse-otel"
+    
+env:
+  LANGFUSE_AUTO_MODEL_MAPPING: "true"
+  LANGFUSE_PARSE_OTEL_USAGE: "true"

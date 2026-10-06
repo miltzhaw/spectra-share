@@ -1,0 +1,4 @@
+backend:
+  extraEnvVars:
+    - name: OPENLIT_CUSTOM_PRICING_PATH
+      value: "/app/pricing.json"

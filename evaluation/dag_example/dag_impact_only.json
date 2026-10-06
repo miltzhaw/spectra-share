@@ -1,0 +1,195 @@
+{
+  "num_events": 28,
+  "num_edges": 27,
+  "edges": [
+    {
+      "from_event_id": "7e1cbd59-4a9c-49c4-8c50-10fcf3151817",
+      "to_event_id": "e01cdeaf-b184-4050-bfeb-5e37de54d420",
+      "reason": "intra_agent_sequence",
+      "from_agent": "synthesis_agent",
+      "to_agent": "synthesis_agent"
+    },
+    {
+      "from_event_id": "35a30f34-0a72-4014-b2fe-09fb35ca6b4b",
+      "to_event_id": "5c696185-6dec-409a-94e6-05dad364f06c",
+      "reason": "intra_agent_sequence",
+      "from_agent": "analysis_agent",
+      "to_agent": "analysis_agent"
+    },
+    {
+      "from_event_id": "8baf50f6-a1c6-4781-8b14-b56ec5433271",
+      "to_event_id": "581d2b2a-b420-49ee-b324-710111105d44",
+      "reason": "intra_agent_sequence",
+      "from_agent": "synthesis_agent",
+      "to_agent": "synthesis_agent"
+    },
+    {
+      "from_event_id": "581d2b2a-b420-49ee-b324-710111105d44",
+      "to_event_id": "7e1cbd59-4a9c-49c4-8c50-10fcf3151817",
+      "reason": "intra_agent_sequence",
+      "from_agent": "synthesis_agent",
+      "to_agent": "synthesis_agent"
+    },
+    {
+      "from_event_id": "03970112-7c2a-49a0-af64-2b5c4e5495e6",
+      "to_event_id": "e70c83a9-38d6-4536-8c45-6ca60ad85d9b",
+      "reason": "intra_agent_sequence",
+      "from_agent": "impact_agent",
+      "to_agent": "impact_agent"
+    },
+    {
+      "from_event_id": "eeac7830-c451-460e-9ed8-0bd84aacf472",
+      "to_event_id": "4ac543f7-d350-4168-95d5-6bfc6cbcda48",
+      "reason": "intra_agent_sequence",
+      "from_agent": "citation_agent",
+      "to_agent": "citation_agent"
+    },
+    {
+      "from_event_id": "951a3ff7-a5f1-48cf-82ef-09b6b1958a1b",
+      "to_event_id": "92ffee30-f293-41c1-803f-69b522f66ed3",
+      "reason": "intra_agent_sequence",
+      "from_agent": "citation_agent",
+      "to_agent": "citation_agent"
+    },
+    {
+      "from_event_id": "d399eff8-cd3d-4f48-b58d-878129751dc9",
+      "to_event_id": "6858acc9-2699-405e-a7c6-5bfbeb9cbac2",
+      "reason": "intra_agent_sequence",
+      "from_agent": "ingestion_agent",
+      "to_agent": "ingestion_agent"
+    },
+    {
+      "from_event_id": "e70c83a9-38d6-4536-8c45-6ca60ad85d9b",
+      "to_event_id": "722b4b2f-94c5-4dc8-aab8-1a0b60c5c7aa",
+      "reason": "intra_agent_sequence",
+      "from_agent": "impact_agent",
+      "to_agent": "impact_agent"
+    },
+    {
+      "from_event_id": "237e85b8-222d-4a43-94c9-d47f0b7b2ac6",
+      "to_event_id": "d8215cfd-c311-4a29-b8eb-845099e9aa52",
+      "reason": "intra_agent_sequence",
+      "from_agent": "analysis_agent",
+      "to_agent": "analysis_agent"
+    },
+    {
+      "from_event_id": "b5a1b9cd-86d4-43ef-b43a-9bc0dd52eb83",
+      "to_event_id": "35a30f34-0a72-4014-b2fe-09fb35ca6b4b",
+      "reason": "delegation",
+      "from_agent": "ingestion_agent",
+      "to_agent": "analysis_agent"
+    },
+    {
+      "from_event_id": "4ac543f7-d350-4168-95d5-6bfc6cbcda48",
+      "to_event_id": "a1f06f0f-433d-4ecf-af1a-279bfb16a7db",
+      "reason": "intra_agent_sequence",
+      "from_agent": "citation_agent",
+      "to_agent": "citation_agent"
+    },
+    {
+      "from_event_id": "029c171c-8bcd-4ccd-a024-cf46e82a4662",
+      "to_event_id": "8baf50f6-a1c6-4781-8b14-b56ec5433271",
+      "reason": "intra_agent_sequence",
+      "from_agent": "synthesis_agent",
+      "to_agent": "synthesis_agent"
+    },
+    {
+      "from_event_id": "37aa1086-416f-4183-ad9d-2e67694a6ede",
+      "to_event_id": "8ace381d-2d19-421f-8f36-8af0d3a6faa7",
+      "reason": "intra_agent_sequence",
+      "from_agent": "impact_agent",
+      "to_agent": "impact_agent"
+    },
+    {
+      "from_event_id": "6858acc9-2699-405e-a7c6-5bfbeb9cbac2",
+      "to_event_id": "16381e9e-6e7e-4091-87f6-94b1aa188377",
+      "reason": "intra_agent_sequence",
+      "from_agent": "ingestion_agent",
+      "to_agent": "ingestion_agent"
+    },
+    {
+      "from_event_id": "a1f06f0f-433d-4ecf-af1a-279bfb16a7db",
+      "to_event_id": "4cca8cb9-77cc-4cee-b59b-c66a7b3a34cb",
+      "reason": "intra_agent_sequence",
+      "from_agent": "citation_agent",
+      "to_agent": "citation_agent"
+    },
+    {
+      "from_event_id": "8ace381d-2d19-421f-8f36-8af0d3a6faa7",
+      "to_event_id": "951a3ff7-a5f1-48cf-82ef-09b6b1958a1b",
+      "reason": "delegation",
+      "from_agent": "impact_agent",
+      "to_agent": "citation_agent"
+    },
+    {
+      "from_event_id": "92ffee30-f293-41c1-803f-69b522f66ed3",
+      "to_event_id": "eeac7830-c451-460e-9ed8-0bd84aacf472",
+      "reason": "intra_agent_sequence",
+      "from_agent": "citation_agent",
+      "to_agent": "citation_agent"
+    },
+    {
+      "from_event_id": "4cca8cb9-77cc-4cee-b59b-c66a7b3a34cb",
+      "to_event_id": "029c171c-8bcd-4ccd-a024-cf46e82a4662",
+      "reason": "delegation",
+      "from_agent": "citation_agent",
+      "to_agent": "synthesis_agent"
+    },
+    {
+      "from_event_id": "267f2ac8-ff74-4bd2-a6bd-aaa71f0026c4",
+      "to_event_id": "03970112-7c2a-49a0-af64-2b5c4e5495e6",
+      "reason": "delegation",
+      "from_agent": "analysis_agent",
+      "to_agent": "impact_agent"
+    },
+    {
+      "from_event_id": "5c696185-6dec-409a-94e6-05dad364f06c",
+      "to_event_id": "e3560be5-2ad8-4fda-9e27-596242aac727",
+      "reason": "intra_agent_sequence",
+      "from_agent": "analysis_agent",
+      "to_agent": "analysis_agent"
+    },
+    {
+      "from_event_id": "ea199c48-2293-468a-9614-2351ba1ac745",
+      "to_event_id": "b05c755f-66dc-4ecc-bd35-1ac9d0771c36",
+      "reason": "intra_agent_sequence",
+      "from_agent": "ingestion_agent",
+      "to_agent": "ingestion_agent"
+    },
+    {
+      "from_event_id": "e3560be5-2ad8-4fda-9e27-596242aac727",
+      "to_event_id": "237e85b8-222d-4a43-94c9-d47f0b7b2ac6",
+      "reason": "intra_agent_sequence",
+      "from_agent": "analysis_agent",
+      "to_agent": "analysis_agent"
+    },
+    {
+      "from_event_id": "722b4b2f-94c5-4dc8-aab8-1a0b60c5c7aa",
+      "to_event_id": "37aa1086-416f-4183-ad9d-2e67694a6ede",
+      "reason": "intra_agent_sequence",
+      "from_agent": "impact_agent",
+      "to_agent": "impact_agent"
+    },
+    {
+      "from_event_id": "b05c755f-66dc-4ecc-bd35-1ac9d0771c36",
+      "to_event_id": "b5a1b9cd-86d4-43ef-b43a-9bc0dd52eb83",
+      "reason": "intra_agent_sequence",
+      "from_agent": "ingestion_agent",
+      "to_agent": "ingestion_agent"
+    },
+    {
+      "from_event_id": "16381e9e-6e7e-4091-87f6-94b1aa188377",
+      "to_event_id": "ea199c48-2293-468a-9614-2351ba1ac745",
+      "reason": "intra_agent_sequence",
+      "from_agent": "ingestion_agent",
+      "to_agent": "ingestion_agent"
+    },
+    {
+      "from_event_id": "d8215cfd-c311-4a29-b8eb-845099e9aa52",
+      "to_event_id": "267f2ac8-ff74-4bd2-a6bd-aaa71f0026c4",
+      "reason": "intra_agent_sequence",
+      "from_agent": "analysis_agent",
+      "to_agent": "analysis_agent"
+    }
+  ]
+}

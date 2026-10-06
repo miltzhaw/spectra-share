@@ -1,0 +1,1052 @@
+# =============================================================================
+# MULTI-AGENT OBSERVABILITY DEMO — LangGraph Edition  (namespace: openlit-demo)
+# Stack: OpenLIT · Jaeger · Prometheus · Grafana · Langfuse · Phoenix · Flowcept
+#
+# WHAT THIS FILE DEPLOYS
+#   langgraph-agent    — LangGraph research+synthesis pipeline (5-node graph)
+#   langgraph-ui       — Provenance Dashboard wired to the LangGraph REST API
+#
+# PREREQUISITE
+#   The base stack must already be deployed (deploy/local-k3s/demo_test.yaml on
+#   laptop, or deploy/robopaas/demo_test_robopaas.yaml on the GPU cluster).
+#   This file reuses: otel-collector, flowcept-redis, flowcept-mongodb,
+#   flowcept-consumer, flowcept-rest, flowcept-agent, ollama.
+#
+# GRAPH TOPOLOGY
+#
+#   ┌──────────────┐
+#   │  supervisor  │ ── routes by intent ──┐
+#   └──────────────┘                       │
+#          │                               ▼
+#          │                      ┌──────────────┐
+#          │                      │  researcher  │
+#          │                      └──────────────┘
+#          │                               │
+#          │                               ▼
+#          │                      ┌──────────────┐
+#          └─────────────────────▶│    critic    │ ──(needs_revision)──▶ researcher
+#                                 └──────────────┘
+#                                          │ (approved)
+#                                          ▼
+#                                 ┌──────────────┐
+#                                 │ synthesizer  │
+#                                 └──────────────┘
+#                                          │
+#                                          ▼
+#                                 ┌──────────────┐
+#                                 │  validator   │ ──(retry)──▶ synthesizer
+#                                 └──────────────┘
+#                                          │ (done)
+#                                          ▼
+#                                       END
+#
+# PORT-FORWARDS REQUIRED (each in its own terminal)
+#
+#   — From demo_test.yaml (must already be running) —
+#   kubectl port-forward svc/flowcept-rest   -n openlit-demo 5000:5000   # REST API + PROV-AGENT
+#
+#   — From this file —
+#   kubectl port-forward svc/langgraph-agent -n openlit-demo 8081:8000   # trigger runs
+#   kubectl port-forward svc/langgraph-ui    -n openlit-demo 8021:8021   # provenance UI
+#
+#   — Optional (shared observability backends from demo_test.yaml) —
+#   kubectl port-forward svc/jaeger          -n openlit-demo 16686:16686
+#   kubectl port-forward svc/grafana         -n openlit-demo 3001:3000
+#   kubectl port-forward svc/phoenix         -n openlit-demo 6006:6006
+#   kubectl port-forward svc/openlit         -n openlit      3000:3000
+#   kubectl port-forward svc/langfuse-web    -n langfuse     3002:3000
+#
+# NOTE: The LangGraph UI connects to flowcept-rest at http://localhost:5000/api/v1
+#   by default. If you forward flowcept-rest to a different local port, update
+#   the REST API field in the UI before clicking Connect.
+#
+# QUICK START
+#   1. Ensure demo_test.yaml is deployed and its port-forwards are running
+#   2. kubectl apply -f demo_langgraph.yaml
+#   3. Wait ~3 min for pip install and model availability
+#   4. Start the two new port-forwards above (langgraph-agent, langgraph-ui)
+#   5. Trigger runs:
+#        curl "http://localhost:8081/run?topic=quantum+computing"
+#        curl "http://localhost:8081/run?topic=neural+networks+in+robotics"
+#        curl "http://localhost:8081/run?topic=climate"
+#   6. Open UI: http://localhost:8021
+#   7. Click Connect — Prov Graph shows 5 swimlanes with revision cycles
+#
+# REDEPLOYMENT
+#   kubectl apply -f demo_langgraph.yaml
+#   kubectl rollout restart deployment/langgraph-agent deployment/langgraph-ui \
+#     -n openlit-demo
+#   # Clear only LangGraph tasks (preserves base demo data):
+#   kubectl exec -n openlit-demo deployment/flowcept-mongodb -- \
+#     mongosh flowcept --eval "db.tasks.deleteMany({'custom_metadata.framework':'langgraph'})"
+#   # Or clear everything:
+#   kubectl exec -n openlit-demo deployment/flowcept-mongodb -- \
+#     mongosh flowcept --eval "db.tasks.drop()"
+# =============================================================================
+
+---
+# =============================================================================
+# LangGraph Agent — 5-node research+synthesis pipeline
+# Exposes GET /run?topic=<topic>  (default topic: "quantum computing")
+# Each node emits one Flowcept task record with workflow_id = run_id
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langgraph-agent
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: langgraph-agent
+  template:
+    metadata:
+      labels:
+        app: langgraph-agent
+    spec:
+      containers:
+        - name: langgraph-agent
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir \
+                fastapi uvicorn requests openai openlit \
+                opentelemetry-sdk opentelemetry-exporter-otlp \
+                langgraph langchain-core langchain-openai \
+                pymongo redis gitpython pytz
+
+              cat <<'PY' > /app.py
+              import os, json, time, uuid, redis as redis_lib
+              import requests as http_requests
+              from typing import TypedDict, Annotated, Literal
+              from fastapi import FastAPI, Request
+              from opentelemetry import trace
+              from opentelemetry.propagate import inject, extract
+              import openlit
+
+              os.environ["OTEL_SERVICE_NAME"] = "langgraph-agent"
+              os.environ["OPENLIT_APPLICATION_NAME"] = "langgraph-demo"
+              openlit.init()
+
+              from langgraph.graph import StateGraph, END
+              from langchain_openai import ChatOpenAI
+              from langchain_core.messages import HumanMessage, SystemMessage
+
+              app = FastAPI(title="LangGraph Provenance Demo")
+              tracer = trace.get_tracer("langgraph-agent")
+              r_client = redis_lib.Redis(host="flowcept-redis", port=6379, decode_responses=True)
+
+              # ── LLM client (Ollama via OpenAI-compatible API) ──────────────
+              llm = ChatOpenAI(
+                  api_key="ollama",
+                  base_url="http://ollama:11434/v1",
+                  model="tinyllama",
+                  max_tokens=200,
+                  temperature=0.7,
+              )
+
+              # ── Flowcept task emitter ──────────────────────────────────────
+              def emit(activity_id: str, agent: str, run_id: str,
+                       used: dict, generated: dict,
+                       started_at: float, ended_at: float,
+                       status: str = "FINISHED", exception: str = None):
+                  record = {
+                      "activity_id": activity_id,
+                      "workflow_id": run_id,
+                      "custom_metadata": {"agent": agent, "framework": "langgraph"},
+                      "used": used,
+                      "generated": generated,
+                      "started_at": started_at,
+                      "ended_at": ended_at,
+                      "status": status,
+                  }
+                  if exception:
+                      record["exception"] = exception
+                  try:
+                      r_client.rpush("interception", json.dumps(record))
+                  except Exception as e:
+                      print(f"[Flowcept] emit failed: {e}", flush=True)
+
+              # ── Graph state ────────────────────────────────────────────────
+              class ResearchState(TypedDict):
+                  topic: str
+                  run_id: str
+                  research: str
+                  critique: str
+                  synthesis: str
+                  revision_count: int
+                  validation_count: int
+                  route: str
+
+              # ── Node implementations ───────────────────────────────────────
+
+              def supervisor_node(state: ResearchState) -> ResearchState:
+                  """Routes the initial request and sets up run context."""
+                  t0 = time.time()
+                  topic = state["topic"]
+                  print(f"[supervisor] Routing topic: {topic}", flush=True)
+
+                  # Decide research depth based on topic length (simple heuristic)
+                  route = "deep" if len(topic.split()) > 3 else "standard"
+
+                  emit(
+                      activity_id="supervisor",
+                      agent="supervisor",
+                      run_id=state["run_id"],
+                      used={"topic": topic},
+                      generated={"route": route},
+                      started_at=t0,
+                      ended_at=time.time(),
+                  )
+                  return {**state, "route": route}
+
+
+              def researcher_node(state: ResearchState) -> ResearchState:
+                  """Calls LLM to produce research on the topic."""
+                  t0 = time.time()
+                  topic = state["topic"]
+                  revision = state.get("revision_count", 0)
+                  critique = state.get("critique", "")
+
+                  prompt = f"Provide a concise research summary on: {topic}."
+                  if critique:
+                      prompt += f" Previous critique to address: {critique}"
+
+                  print(f"[researcher] LLM call (revision={revision})", flush=True)
+                  try:
+                      resp = llm.invoke([
+                          SystemMessage(content="You are a research assistant. Be factual and concise."),
+                          HumanMessage(content=prompt)
+                      ])
+                      research = resp.content
+                      status = "FINISHED"
+                      exc = None
+                  except Exception as e:
+                      research = f"Research unavailable: {e}"
+                      status = "ERROR"
+                      exc = str(e)
+
+                  emit(
+                      activity_id="researcher",
+                      agent="researcher",
+                      run_id=state["run_id"],
+                      used={"topic": topic, "critique": critique, "revision": revision},
+                      generated={"research": research[:200]},
+                      started_at=t0,
+                      ended_at=time.time(),
+                      status=status,
+                      exception=exc,
+                  )
+                  return {**state, "research": research, "revision_count": revision + 1}
+
+
+              def critic_node(state: ResearchState) -> ResearchState:
+                  """Evaluates the research and decides whether to approve or request revision."""
+                  t0 = time.time()
+                  research = state["research"]
+                  revision_count = state.get("revision_count", 0)
+
+                  print(f"[critic] Evaluating research (revision_count={revision_count})", flush=True)
+
+                  # After 2 revisions always approve to avoid infinite loops
+                  if revision_count >= 2:
+                      critique = ""
+                      decision = "approved"
+                  else:
+                      try:
+                          resp = llm.invoke([
+                              SystemMessage(content="You are a critical reviewer. Reply with either "
+                                            "'APPROVED' if the research is adequate, or 'REVISE: <reason>' "
+                                            "if it needs improvement. Be brief."),
+                              HumanMessage(content=f"Review this research:\n{research}")
+                          ])
+                          raw = resp.content.strip()
+                          if raw.upper().startswith("APPROVED"):
+                              critique = ""
+                              decision = "approved"
+                          else:
+                              critique = raw.replace("REVISE:", "").strip()
+                              decision = "needs_revision"
+                      except Exception as e:
+                          critique = ""
+                          decision = "approved"
+
+                  emit(
+                      activity_id="critic",
+                      agent="critic",
+                      run_id=state["run_id"],
+                      used={"research": research[:200]},
+                      generated={"decision": decision, "critique": critique},
+                      started_at=t0,
+                      ended_at=time.time(),
+                  )
+                  return {**state, "critique": critique, "route": decision}
+
+
+              def synthesizer_node(state: ResearchState) -> ResearchState:
+                  """Writes the final synthesis from the approved research."""
+                  t0 = time.time()
+                  research = state["research"]
+                  topic = state["topic"]
+                  val_count = state.get("validation_count", 0)
+
+                  print(f"[synthesizer] Writing synthesis (val_count={val_count})", flush=True)
+                  try:
+                      resp = llm.invoke([
+                          SystemMessage(content="You are a technical writer. Write a clear, "
+                                        "structured summary suitable for a general audience."),
+                          HumanMessage(content=f"Write a synthesis about '{topic}' based on:\n{research}")
+                      ])
+                      synthesis = resp.content
+                      status = "FINISHED"
+                      exc = None
+                  except Exception as e:
+                      synthesis = f"Synthesis unavailable: {e}"
+                      status = "ERROR"
+                      exc = str(e)
+
+                  emit(
+                      activity_id="synthesizer",
+                      agent="synthesizer",
+                      run_id=state["run_id"],
+                      used={"research": research[:200], "topic": topic},
+                      generated={"synthesis": synthesis[:200]},
+                      started_at=t0,
+                      ended_at=time.time(),
+                      status=status,
+                      exception=exc,
+                  )
+                  return {**state, "synthesis": synthesis, "validation_count": val_count + 1}
+
+
+              def validator_node(state: ResearchState) -> ResearchState:
+                  """Validates synthesis quality; routes to retry or done."""
+                  t0 = time.time()
+                  synthesis = state["synthesis"]
+                  val_count = state.get("validation_count", 0)
+
+                  print(f"[validator] Validating (val_count={val_count})", flush=True)
+
+                  # Simple quality check: length and keyword presence
+                  word_count = len(synthesis.split())
+                  if val_count >= 2 or word_count >= 30:
+                      decision = "done"
+                  else:
+                      decision = "retry"
+
+                  emit(
+                      activity_id="validator",
+                      agent="validator",
+                      run_id=state["run_id"],
+                      used={"synthesis": synthesis[:200], "word_count": word_count},
+                      generated={"decision": decision, "word_count": word_count},
+                      started_at=t0,
+                      ended_at=time.time(),
+                  )
+                  return {**state, "route": decision}
+
+
+              # ── Conditional edge functions ─────────────────────────────────
+              def route_after_critic(state: ResearchState) -> Literal["researcher", "synthesizer"]:
+                  return "researcher" if state.get("route") == "needs_revision" else "synthesizer"
+
+              def route_after_validator(state: ResearchState) -> Literal["synthesizer", "__end__"]:
+                  return "synthesizer" if state.get("route") == "retry" else END
+
+
+              # ── Build the graph ────────────────────────────────────────────
+              builder = StateGraph(ResearchState)
+              builder.add_node("supervisor",   supervisor_node)
+              builder.add_node("researcher",   researcher_node)
+              builder.add_node("critic",       critic_node)
+              builder.add_node("synthesizer",  synthesizer_node)
+              builder.add_node("validator",    validator_node)
+
+              builder.set_entry_point("supervisor")
+              builder.add_edge("supervisor",  "researcher")
+              builder.add_edge("researcher",  "critic")
+              builder.add_conditional_edges("critic",     route_after_critic)
+              builder.add_edge("synthesizer", "validator")
+              builder.add_conditional_edges("validator",  route_after_validator)
+
+              graph = builder.compile()
+
+
+              # ── FastAPI endpoint ───────────────────────────────────────────
+              @app.get("/run")
+              def run(topic: str = "quantum computing", request: Request = None):
+                  run_id = str(uuid.uuid4())[:8]
+                  print(f"[langgraph] /run topic={topic!r} run_id={run_id}", flush=True)
+
+                  ctx = extract(dict(request.headers)) if request else {}
+                  with tracer.start_as_current_span("langgraph.run", context=ctx):
+                      initial_state: ResearchState = {
+                          "topic": topic,
+                          "run_id": run_id,
+                          "research": "",
+                          "critique": "",
+                          "synthesis": "",
+                          "revision_count": 0,
+                          "validation_count": 0,
+                          "route": "",
+                      }
+                      try:
+                          final_state = graph.invoke(initial_state)
+                          return {
+                              "run_id": run_id,
+                              "topic": topic,
+                              "synthesis": final_state.get("synthesis", ""),
+                              "revisions": final_state.get("revision_count", 0),
+                              "validations": final_state.get("validation_count", 0),
+                          }
+                      except Exception as e:
+                          print(f"[langgraph] graph error: {e}", flush=True)
+                          return {"run_id": run_id, "error": str(e)}
+
+              @app.get("/health")
+              def health():
+                  return {"status": "ok", "framework": "langgraph"}
+              PY
+              python3 -u -m uvicorn app:app --host 0.0.0.0 --port 8000
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: OTEL_SERVICE_NAME
+              value: "langgraph-agent"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.openlit-demo.svc.cluster.local:4318"
+            - name: OPENLIT_APPLICATION_NAME
+              value: "langgraph-demo"
+            - name: OPENLIT_ENVIRONMENT
+              value: "dev"
+            - name: OPENLIT_PRICING_JSON
+              value: '{"tinyllama": {"prompt_token": 0.10, "completion_token": 0.10}}'
+            - name: OPENAI_API_KEY
+              value: "ollama"
+            - name: OPENAI_BASE_URL
+              value: "http://ollama:11434/v1"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "300m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph-agent
+  namespace: openlit-demo
+spec:
+  selector:
+    app: langgraph-agent
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: NodePort
+
+---
+# =============================================================================
+# LangGraph UI — Provenance Dashboard
+# Identical structure to the base demo UI but pre-wired to the LangGraph
+# agent's workflow_id scheme and shows 5 swimlanes:
+#   supervisor · researcher · critic · synthesizer · validator
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langgraph-ui-html
+  namespace: openlit-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LangGraph Provenance Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.11.0/dist/tabler-icons.min.css">
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      :root{
+        --bg:#0f0f17;--bg2:#16161f;--bg3:#1e1e2a;--text:#e2e2f0;--text2:#9090b0;--text3:#55556a;
+        --border:#2a2a3a;--blue:#5b8dee;--green:#3ecf8e;--amber:#f6a623;--red:#e25555;
+        --purple:#8b5cf6;--teal:#06b6d4;--pink:#ec4899;
+        --font:'IBM Plex Mono','JetBrains Mono',monospace;
+        --radius:6px;
+      }
+      body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:13px;height:100vh;display:flex;flex-direction:column}
+      /* Animated grid background */
+      body::before{content:'';position:fixed;inset:0;
+        background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);
+        background-size:40px 40px;opacity:0.3;pointer-events:none;z-index:0}
+      .topbar{display:flex;align-items:center;gap:10px;padding:10px 16px;
+        border-bottom:1px solid var(--border);background:var(--bg);flex-shrink:0;position:relative;z-index:1}
+      .logo{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px;letter-spacing:0.05em;text-transform:uppercase}
+      .logo-icon{width:26px;height:26px;background:linear-gradient(135deg,var(--purple),var(--teal));
+        border-radius:4px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px}
+      .logo-sub{font-size:9px;color:var(--text3);letter-spacing:0.1em;margin-top:1px}
+      .badge{font-size:10px;padding:2px 8px;border-radius:2px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase}
+      .badge-live{background:#0d2e1f;color:var(--green);border:1px solid var(--green)40}
+      .badge-err{background:#2e0d0d;color:var(--red);border:1px solid var(--red)40}
+      .badge-idle{background:var(--bg3);color:var(--text3);border:1px solid var(--border)}
+      .top-inputs{display:flex;gap:6px;margin-left:auto;align-items:center}
+      .top-inputs input{font-size:11px;padding:5px 9px;border:1px solid var(--border);border-radius:var(--radius);
+        background:var(--bg2);color:var(--text);width:210px;font-family:var(--font)}
+      .top-inputs input:focus{outline:none;border-color:var(--purple)}
+      .btn{font-size:11px;padding:5px 12px;border:1px solid var(--border);border-radius:var(--radius);
+        background:var(--bg2);color:var(--text);cursor:pointer;display:flex;align-items:center;gap:4px;font-family:var(--font)}
+      .btn:hover{background:var(--bg3)}.btn-primary{background:var(--purple);color:#fff;border-color:var(--purple)}.btn-primary:hover{opacity:.85}
+      .main{display:grid;grid-template-columns:1fr 320px;flex:1;overflow:hidden;position:relative;z-index:1}
+      .left{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+      .tabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0}
+      .tab{padding:9px 16px;font-size:11px;cursor:pointer;border-bottom:2px solid transparent;
+        color:var(--text3);white-space:nowrap;text-transform:uppercase;letter-spacing:0.06em}
+      .tab.active{color:var(--text);border-bottom-color:var(--purple);font-weight:700}
+      .tab-actions{margin-left:auto;display:flex;align-items:center;padding-right:8px;gap:6px}
+      .panel{flex:1;overflow-y:auto;padding:14px 16px}
+      .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
+      .metric{background:var(--bg2);border-radius:var(--radius);padding:10px 12px;border:1px solid var(--border)}
+      .metric-lbl{font-size:9px;color:var(--text3);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.08em}
+      .metric-val{font-size:22px;font-weight:700}
+      .val-ok{color:var(--green)}.val-err{color:var(--red)}
+      .sec{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--text3);margin-bottom:8px}
+      .task-list{display:flex;flex-direction:column;gap:2px}
+      .task-row{display:grid;grid-template-columns:10px 1fr auto 56px;align-items:center;
+        gap:10px;padding:7px 10px;border-radius:var(--radius);font-size:11px;cursor:pointer;border:1px solid transparent}
+      .task-row:hover{background:var(--bg2)}.task-row.sel{background:var(--bg2);border-color:var(--border)}
+      .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+      .dot-ok{background:var(--green)}.dot-err{background:var(--red)}.dot-run{background:var(--amber)}
+      .task-info{overflow:hidden}.task-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .task-sub{font-size:10px;color:var(--text3)}
+      .dur{font-size:10px;color:var(--text2);text-align:right;white-space:nowrap}
+      .bar-bg{height:2px;background:var(--bg3);border-radius:1px;overflow:hidden;margin-top:2px}
+      .bar-fill{height:100%;border-radius:1px}
+      .bar-ok{background:var(--green)}.bar-err{background:var(--red)}.bar-run{background:var(--amber)}
+      .prov-area{padding:8px;overflow:auto}
+      .right{display:flex;flex-direction:column;overflow:hidden}
+      .detail{flex:0 0 auto;padding:12px 14px;border-bottom:1px solid var(--border);max-height:200px;overflow-y:auto}
+      .detail h3{font-size:11px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:6px;
+        text-transform:uppercase;letter-spacing:0.06em;color:var(--text2)}
+      .kv-grid{display:grid;grid-template-columns:80px 1fr;gap:2px 8px;font-size:11px}
+      .kv-k{color:var(--text3);padding:2px 0}.kv-v{padding:2px 0;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap;font-family:var(--font);font-size:10px;color:var(--text)}
+      .chat-section{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+      .chat-header{padding:9px 14px;font-size:10px;font-weight:700;border-bottom:1px solid var(--border);
+        display:flex;align-items:center;gap:6px;flex-shrink:0;text-transform:uppercase;letter-spacing:0.06em;color:var(--text2)}
+      .quick{display:flex;flex-wrap:wrap;gap:4px;padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0}
+      .qbtn{font-size:10px;padding:3px 9px;border-radius:2px;border:1px solid var(--border);
+        background:var(--bg2);color:var(--text3);cursor:pointer;font-family:var(--font)}
+      .qbtn:hover{background:var(--bg3);color:var(--text)}
+      .msgs{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-height:0}
+      .msg{max-width:90%;padding:8px 11px;border-radius:var(--radius);font-size:11px;line-height:1.6;font-family:var(--font)}
+      .msg-user{align-self:flex-end;background:var(--purple)22;border:1px solid var(--purple)44;color:var(--text)}
+      .msg-agent{align-self:flex-start;background:var(--bg2);border:1px solid var(--border)}
+      .msg-loading{opacity:.5;font-style:italic}
+      .input-row{display:flex;gap:6px;padding:8px 12px;border-top:1px solid var(--border);flex-shrink:0}
+      .input-row input{flex:1;font-size:11px;padding:7px 10px;border:1px solid var(--border);
+        border-radius:var(--radius);background:var(--bg2);color:var(--text);font-family:var(--font)}
+      .input-row input:focus{outline:none;border-color:var(--purple)}
+      .empty{text-align:center;padding:48px 16px;color:var(--text3)}
+      .empty i{font-size:28px;display:block;margin-bottom:10px;opacity:0.4}
+      svg text{font-family:var(--font)}
+      pre{font-family:var(--font);font-size:10px;white-space:pre-wrap;word-break:break-all}
+
+      /* Node-type colours for the 5 agent lanes */
+      :root{
+        --col-supervisor:#8b5cf6;
+        --col-researcher:#3ecf8e;
+        --col-critic:#f6a623;
+        --col-synthesizer:#5b8dee;
+        --col-validator:#ec4899;
+      }
+    </style>
+    </head>
+    <body>
+    <div class="topbar">
+      <div class="logo">
+        <div class="logo-icon"><i class="ti ti-hierarchy-3"></i></div>
+        <div><div>LangGraph Provenance</div><div class="logo-sub">W3C PROV · Flowcept</div></div>
+      </div>
+      <span class="badge badge-idle" id="badge">● idle</span>
+      <div class="top-inputs">
+        <input id="rest-url" value="http://localhost:5000/api/v1" placeholder="REST API"/>
+        <input id="agent-url" value="http://localhost:5000" placeholder="PROV-AGENT" style="width:160px"/>
+        <button class="btn btn-primary" onclick="connect()"><i class="ti ti-plug"></i> Connect</button>
+      </div>
+    </div>
+    <div class="main">
+      <div class="left">
+        <div class="tabs">
+          <div class="tab active" onclick="switchTab('tasks',this)">Tasks</div>
+          <div class="tab" onclick="switchTab('graph',this)">Prov Graph</div>
+          <div class="tab-actions">
+            <button class="btn" onclick="refresh()" title="Refresh"><i class="ti ti-refresh"></i></button>
+            <button class="btn" onclick="clearDB()" title="Clear DB" style="opacity:0.5"><i class="ti ti-trash"></i></button>
+          </div>
+        </div>
+        <div class="panel" id="panel-tasks">
+          <div class="metrics">
+            <div class="metric"><div class="metric-lbl">Total tasks</div><div class="metric-val" id="m-total">—</div></div>
+            <div class="metric"><div class="metric-lbl">Completed</div><div class="metric-val val-ok" id="m-ok">—</div></div>
+            <div class="metric"><div class="metric-lbl">Errors</div><div class="metric-val val-err" id="m-err">—</div></div>
+            <div class="metric"><div class="metric-lbl">Avg duration</div><div class="metric-val" id="m-avg">—</div></div>
+          </div>
+          <div class="sec">Recent tasks</div>
+          <div class="task-list" id="task-list">
+            <div class="empty"><i class="ti ti-database-off"></i>Connect to load tasks</div>
+          </div>
+        </div>
+        <div class="panel" id="panel-graph" style="display:none">
+          <div class="sec" style="margin-bottom:8px">W3C PROV lineage graph</div>
+          <div class="prov-area" style="overflow:auto;max-height:calc(100vh - 140px)">
+            <svg id="prov-svg" width="100%" xmlns="http://www.w3.org/2000/svg">
+              <text x="300" y="140" text-anchor="middle" font-size="12" fill="#55556a">Connect and load tasks to render graph</text>
+            </svg>
+          </div>
+        </div>
+      </div>
+      <div class="right">
+        <div class="detail">
+          <h3><i class="ti ti-info-circle"></i> Task detail</h3>
+          <div id="detail-body" style="color:var(--text3);font-size:11px">Select a task to inspect</div>
+        </div>
+        <div class="chat-section">
+          <div class="chat-header"><i class="ti ti-robot"></i> PROV-AGENT</div>
+          <div class="quick">
+            <button class="qbtn" onclick="q('which agent took longest on average?')">slowest node?</button>
+            <button class="qbtn" onclick="q('show failed tasks and their inputs')">failures?</button>
+            <button class="qbtn" onclick="q('what inputs did researcher receive?')">researcher inputs?</button>
+            <button class="qbtn" onclick="q('how many tasks ran?')">task count?</button>
+          </div>
+          <div class="msgs" id="msgs">
+            <div class="msg msg-agent">Connect the PROV-AGENT, then query your LangGraph provenance.</div>
+          </div>
+          <div class="input-row">
+            <input id="qin" placeholder="Ask about nodes, revisions, synthesis quality..."
+                   onkeydown="if(event.key==='Enter')sendQ()"/>
+            <button class="btn btn-primary" onclick="sendQ()"><i class="ti ti-send"></i></button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+    // ── Agent lane colours (must match CSS vars above) ────────────────────────
+    const LANE_COLS = {
+      supervisor:  '#8b5cf6',
+      researcher:  '#3ecf8e',
+      critic:      '#f6a623',
+      synthesizer: '#5b8dee',
+      validator:   '#ec4899',
+    };
+    const LANE_ORDER = ['supervisor','researcher','critic','synthesizer','validator'];
+    const DEFAULT_COL = '#9090b0';
+    const CROSS_COL   = '#e25555';
+
+    let restBase = 'http://localhost:5000/api/v1';
+    let agentBase = 'http://localhost:5000';
+    let tasks = [], selId = null, activeTab = 'tasks';
+    let _graphRuns = [], _selectedRunIdx = 0;
+
+    function setBadge(txt,cls){const b=document.getElementById('badge');b.textContent=txt;b.className='badge '+cls}
+    function switchTab(n,el){
+      activeTab=n;
+      document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+      el.classList.add('active');
+      ['tasks','graph'].forEach(t=>{
+        const p=document.getElementById('panel-'+t);
+        if(p)p.style.display=t===n?'':'none';
+      });
+      if(n==='graph')drawGraph();
+    }
+
+    async function connect(){
+      restBase=document.getElementById('rest-url').value.replace(/\/$/,'');
+      agentBase=document.getElementById('agent-url').value.replace(/\/$/,'');
+      setBadge('● connecting','badge-idle');
+      try{
+        const r=await fetch(restBase+'/api/v1');
+        if(r.ok){setBadge('● connected','badge-live');await refresh();}
+        else throw new Error();
+      }catch(e){setBadge('● error','badge-err');}
+    }
+
+    async function clearDB(){
+      if(!confirm('Delete ALL tasks from MongoDB?'))return;
+      try{
+        const r=await fetch(restBase+'/api/v1/tasks/clear',{method:'DELETE'});
+        if(r.ok){tasks=[];_selectedRunIdx=0;renderTasks();updateMetrics();drawGraph();}
+        else alert('Clear failed: '+r.status);
+      }catch(e){alert('Clear failed: '+e);}
+    }
+
+    async function refresh(){
+      try{
+        const r=await fetch(restBase+'/api/v1/tasks?limit=200');
+        if(!r.ok)throw new Error();
+        const d=await r.json();
+        // Filter to LangGraph tasks only (framework=langgraph in custom_metadata)
+        const all=d.tasks||d||[];
+        tasks=all.filter(t=>{
+          const meta=t.custom_metadata||{};
+          return typeof meta==='object' && meta.framework==='langgraph';
+        });
+        _selectedRunIdx=-1;
+        renderTasks();updateMetrics();
+        if(activeTab==='graph')drawGraph();
+      }catch(e){console.error(e);}
+    }
+
+    function dur(t){if(!t.ended_at||!t.started_at)return null;return(t.ended_at-t.started_at)*1000;}
+    function fmtD(ms){if(ms===null||ms===undefined)return'—';if(ms<1000)return Math.round(ms)+'ms';return(ms/1000).toFixed(2)+'s';}
+
+    function updateMetrics(){
+      const tot=tasks.length;
+      const errs=tasks.filter(t=>t.status==='ERROR'||t.exception).length;
+      const ok=tasks.filter(t=>(t.status||'').toUpperCase()==='FINISHED').length;
+      const ds=tasks.map(t=>dur(t)).filter(d=>d!==null);
+      const avg=ds.length?ds.reduce((a,b)=>a+b,0)/ds.length:null;
+      document.getElementById('m-total').textContent=tot;
+      document.getElementById('m-ok').textContent=ok;
+      document.getElementById('m-err').textContent=errs;
+      document.getElementById('m-avg').textContent=fmtD(avg);
+    }
+
+    function renderTasks(){
+      const el=document.getElementById('task-list');
+      if(!tasks.length){
+        el.innerHTML='<div class="empty"><i class="ti ti-database-off"></i>No LangGraph tasks found</div>';
+        return;
+      }
+      const mx=Math.max(...tasks.map(t=>dur(t)||0),1);
+      el.innerHTML=tasks.slice(0,60).map(t=>{
+        const d=dur(t);
+        const isErr=t.status==='ERROR'||!!t.exception;
+        const dc=isErr?'dot-err':'dot-ok';
+        const bc=isErr?'bar-err':'bar-ok';
+        const pct=d?Math.max(2,(d/mx)*100):2;
+        const agent=t.agent||t.custom_metadata?.agent||'';
+        const col=LANE_COLS[agent]||DEFAULT_COL;
+        return`<div class="task-row${selId===t.task_id?' sel':''}" onclick="selTask('${t.task_id}')">
+          <div class="dot ${dc}" style="background:${col}"></div>
+          <div class="task-info">
+            <div class="task-name" style="color:${col}">${t.activity_id||t.activity_name||t.task_id}</div>
+            <div class="task-sub">${agent} · ${t.workflow_id||'—'}</div>
+          </div>
+          <div class="dur">${fmtD(d)}</div>
+          <div><div class="bar-bg"><div class="bar-fill ${bc}" style="width:${pct.toFixed(1)}%;background:${col}88"></div></div></div>
+        </div>`;
+      }).join('');
+    }
+
+    function selTask(id){
+      selId=id;renderTasks();
+      const t=tasks.find(x=>x.task_id===id);if(!t)return;
+      const d=dur(t);
+      const meta=t.custom_metadata||{};
+      const rows=[
+        ['ID', t.task_id],
+        ['Node', t.activity_id||'—'],
+        ['Agent', meta.agent||t.agent||'—'],
+        ['Framework', meta.framework||'—'],
+        ['Status', t.status||'—'],
+        ['Duration', fmtD(d)],
+        ['Run ID', t.workflow_id||'—'],
+        ['Input', JSON.stringify(t.used||{}).slice(0,90)],
+        ['Output', JSON.stringify(t.generated||{}).slice(0,90)],
+      ];
+      if(t.exception) rows.push(['Error', String(t.exception).slice(0,90)]);
+      document.getElementById('detail-body').innerHTML=
+        '<div class="kv-grid">'+rows.map(([k,v])=>
+          `<div class="kv-k">${k}</div><div class="kv-v" title="${String(v).replace(/"/g,'&quot;')}">${v}</div>`
+        ).join('')+'</div>';
+    }
+
+    // ── Run selector ─────────────────────────────────────────────────────────
+    function buildRunSelector(runs, selectedIdx, onSelect){
+      const existing=document.getElementById('run-selector');
+      if(existing)existing.remove();
+      if(runs.length<1)return;
+      const div=document.createElement('div');
+      div.id='run-selector';
+      div.style='display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:wrap;';
+      div.innerHTML='<span style="font-size:10px;color:var(--text3);letter-spacing:0.08em;text-transform:uppercase">Run:</span>';
+      runs.slice(-5).reverse().forEach((r,di)=>{
+        const i=runs.length-1-di;
+        const btn=document.createElement('button');
+        btn.className='btn'+(i===selectedIdx?' btn-primary':'');
+        btn.style='font-size:10px;padding:2px 8px;';
+        const t=r[0];
+        const ts=t.started_at
+          ? new Date(t.started_at*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})
+          : 'run '+(i+1);
+        btn.textContent=ts;
+        btn.onclick=()=>onSelect(i);
+        div.appendChild(btn);
+      });
+      const provArea=document.querySelector('#panel-graph .prov-area');
+      provArea.parentNode.insertBefore(div,provArea);
+    }
+
+    // ── Provenance graph ─────────────────────────────────────────────────────
+    function drawGraph(){
+      const svg=document.getElementById('prov-svg');
+      if(!tasks.length)return;
+
+      const NODE_W=150, NODE_H=44, NODE_GAP=16;
+      const COL_W=170, COL_PAD=12, HEADER_H=44, TOP_PAD=16;
+
+      // Sort and group by workflow_id
+      const sorted=[...tasks].sort((a,b)=>(a.started_at||0)-(b.started_at||0));
+      const withId=sorted.filter(t=>t.workflow_id);
+      const withoutId=sorted.filter(t=>!t.workflow_id);
+
+      let runs=[];
+      if(withId.length){
+        const map={};
+        withId.forEach(t=>{
+          if(!map[t.workflow_id])map[t.workflow_id]=[];
+          map[t.workflow_id].push(t);
+        });
+        runs=Object.values(map).sort((a,b)=>(a[0].started_at||0)-(b[0].started_at||0));
+      }
+      if(withoutId.length){
+        for(let i=0;i<withoutId.length;i+=5) runs.push(withoutId.slice(i,i+5));
+        runs.sort((a,b)=>(a[0].started_at||0)-(b[0].started_at||0));
+      }
+
+      _graphRuns=runs;
+      if(_selectedRunIdx>=runs.length||_selectedRunIdx<0)_selectedRunIdx=runs.length-1;
+      buildRunSelector(runs,_selectedRunIdx,(idx)=>{_selectedRunIdx=idx;drawGraph();});
+
+      const run=runs[_selectedRunIdx]||[];
+
+      // Determine which lanes appear in this run
+      const presentAgents=[...new Set(run.map(t=>t.agent||t.custom_metadata?.agent||'unknown'))];
+      const orderedAgents=LANE_ORDER.filter(a=>presentAgents.includes(a))
+        .concat(presentAgents.filter(a=>!LANE_ORDER.includes(a)));
+
+      const agentTasks={};
+      orderedAgents.forEach(ag=>{
+        agentTasks[ag]=run.filter(t=>(t.agent||t.custom_metadata?.agent||'unknown')===ag)
+          .sort((a,b)=>(a.started_at||0)-(b.started_at||0));
+      });
+
+      const maxRows=Math.max(...orderedAgents.map(a=>agentTasks[a].length),1);
+      const W=Math.max(700,orderedAgents.length*COL_W+COL_PAD*2);
+      const H=HEADER_H+TOP_PAD+maxRows*(NODE_H+NODE_GAP)+NODE_GAP+40;
+
+      svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+      svg.setAttribute('height',H);
+
+      const pos={};
+      let s=`<defs>
+        <marker id="arr" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="5" markerHeight="5" orient="auto">
+          <path d="M1 1L11 6L1 11" fill="none" stroke="#55556a" stroke-width="2" stroke-linecap="round"/>
+        </marker>
+        <marker id="arr-x" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="5" markerHeight="5" orient="auto">
+          <path d="M1 1L11 6L1 11" fill="none" stroke="${CROSS_COL}" stroke-width="2" stroke-linecap="round"/>
+        </marker>
+        <filter id="glow">
+          <feGaussianBlur stdDeviation="2" result="blur"/>
+          <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+        </filter>
+        <filter id="shadow">
+          <feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.4"/>
+        </filter>
+      </defs>`;
+
+      // Column backgrounds
+      orderedAgents.forEach((ag,ai)=>{
+        const c=LANE_COLS[ag]||DEFAULT_COL;
+        const cx=COL_PAD+ai*COL_W+COL_W/2;
+        const colX=COL_PAD+ai*COL_W;
+        s+=`<rect x="${colX+3}" y="3" width="${COL_W-6}" height="${H-6}" rx="8"
+               fill="${c}08" stroke="${c}30" stroke-width="1"/>`;
+        s+=`<rect x="${cx-48}" y="${TOP_PAD}" width="96" height="26" rx="4"
+               fill="${c}22" stroke="${c}55" stroke-width="1"/>`;
+        s+=`<text x="${cx}" y="${TOP_PAD+17}" text-anchor="middle" font-size="10"
+               font-weight="700" fill="${c}" letter-spacing="0.08em" text-transform="uppercase">${ag.toUpperCase()}</text>`;
+      });
+
+      // Nodes
+      orderedAgents.forEach((ag,ai)=>{
+        const c=LANE_COLS[ag]||DEFAULT_COL;
+        const cx=COL_PAD+ai*COL_W+COL_W/2;
+        agentTasks[ag].forEach((t,ti)=>{
+          const ty=HEADER_H+TOP_PAD+ti*(NODE_H+NODE_GAP)+NODE_H/2;
+          const nx=cx-NODE_W/2, ny=ty-NODE_H/2;
+          const isErr=t.status==='ERROR'||!!t.exception;
+          const sc=isErr?'#e25555':c;
+
+          pos[t.task_id]={x:cx,y:ty,left:nx,right:nx+NODE_W,agent:ag,top:ny,bottom:ny+NODE_H};
+
+          // Card background
+          s+=`<rect x="${nx}" y="${ny}" width="${NODE_W}" height="${NODE_H}" rx="5"
+                 fill="${sc}15" stroke="${sc}60" stroke-width="1.5" filter="url(#shadow)"/>`;
+          // Left accent
+          s+=`<rect x="${nx}" y="${ny+4}" width="3" height="${NODE_H-8}" rx="2" fill="${sc}"/>`;
+
+          const label=(t.activity_id||t.task_id||'task');
+          const shortLabel=label.length>20?label.slice(0,19)+'…':label;
+          s+=`<text x="${nx+10}" y="${ny+16}" font-size="10" font-weight="700" fill="${sc}">${shortLabel}</text>`;
+
+          const d=dur(t);
+          const mark=isErr?'✕ error':'✓';
+          const sub=`${mark}${d!==null?' · '+fmtD(d):''}`;
+          s+=`<text x="${nx+10}" y="${ny+30}" font-size="9" fill="${isErr?'#e25555':'#55556a'}">${sub}</text>`;
+
+          const runLabel=(t.workflow_id||'').slice(-4);
+          if(runLabel)s+=`<text x="${nx+NODE_W-6}" y="${ny+NODE_H-6}" font-size="8" fill="#33334a" text-anchor="end">#${runLabel}</text>`;
+        });
+      });
+
+      // Same-agent sequential arrows
+      orderedAgents.forEach(ag=>{
+        const ts=agentTasks[ag];
+        const c=LANE_COLS[ag]||DEFAULT_COL;
+        for(let i=0;i<ts.length-1;i++){
+          const a=pos[ts[i].task_id],b=pos[ts[i+1].task_id];
+          if(!a||!b)continue;
+          s+=`<line x1="${a.x}" y1="${a.bottom+1}" x2="${b.x}" y2="${b.top-1}"
+                stroke="${c}50" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#arr)"/>`;
+        }
+      });
+
+      // Cross-agent arrows (chronological order)
+      const agentFirstStart={};
+      orderedAgents.forEach(ag=>{
+        const ts=agentTasks[ag];
+        agentFirstStart[ag]=ts.length?Math.min(...ts.map(t=>t.started_at||0)):Infinity;
+      });
+      const timeOrdered=[...orderedAgents].sort((a,b)=>agentFirstStart[a]-agentFirstStart[b]);
+      for(let i=0;i<timeOrdered.length-1;i++){
+        const srcAg=timeOrdered[i],dstAg=timeOrdered[i+1];
+        const sts=agentTasks[srcAg],dts=agentTasks[dstAg];
+        if(!sts.length||!dts.length)continue;
+        const a=pos[sts[sts.length-1].task_id],b=pos[dts[0].task_id];
+        if(!a||!b)continue;
+        const fromRight=a.x<b.x;
+        const x1=fromRight?a.right+1:a.left-1;
+        const x2=fromRight?b.left-1:b.right+1;
+        const mx=(x1+x2)/2;
+        s+=`<path d="M${x1},${a.y} C${mx},${a.y} ${mx},${b.y} ${x2},${b.y}"
+              fill="none" stroke="${CROSS_COL}" stroke-width="2"
+              marker-end="url(#arr-x)"/>`;
+      }
+
+      // Legend
+      const ly=H-24;
+      s+=`<line x1="${COL_PAD+2}" y1="${ly}" x2="${COL_PAD+18}" y2="${ly}"
+            stroke="#33334a" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+      s+=`<text x="${COL_PAD+22}" y="${ly+4}" font-size="9" fill="#33334a">sequential</text>`;
+      s+=`<line x1="${COL_PAD+100}" y1="${ly}" x2="${COL_PAD+116}" y2="${ly}"
+            stroke="${CROSS_COL}" stroke-width="2"/>`;
+      s+=`<text x="${COL_PAD+120}" y="${ly+4}" font-size="9" fill="#33334a">handoff</text>`;
+      s+=`<text x="${W-COL_PAD}" y="${ly+4}" font-size="9" fill="#33334a" text-anchor="end">
+            run ${_selectedRunIdx+1} of ${runs.length}</text>`;
+
+      svg.innerHTML=s;
+    }
+
+    function q(txt){document.getElementById('qin').value=txt;sendQ();}
+    async function sendQ(){
+      const inp=document.getElementById('qin');
+      const qt=inp.value.trim();if(!qt)return;
+      inp.value='';
+      const msgs=document.getElementById('msgs');
+      msgs.innerHTML+=`<div class="msg msg-user">${qt}</div>`;
+      msgs.innerHTML+=`<div class="msg msg-agent msg-loading" id="lmsg">Querying…</div>`;
+      msgs.scrollTop=msgs.scrollHeight;
+      try{
+        const r=await fetch(agentBase+'/query',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({question:qt})
+        });
+        const data=await r.json();
+        let ans=data.answer||data.result||data.response||JSON.stringify(data,null,2);
+        if(typeof ans==='object')ans=JSON.stringify(ans,null,2);
+        const lm=document.getElementById('lmsg');
+        const mono=ans.startsWith('{')||ans.startsWith('[');
+        if(lm)lm.outerHTML=`<div class="msg msg-agent"><${mono?'pre':'span'}>${ans.slice(0,1200)}</${mono?'pre':'span'}></div>`;
+      }catch(e){
+        const lm=document.getElementById('lmsg');
+        if(lm)lm.outerHTML=`<div class="msg msg-agent">⚠ Cannot reach PROV-AGENT at ${agentBase}</div>`;
+      }
+      msgs.scrollTop=msgs.scrollHeight;
+    }
+
+    connect();
+    setInterval(()=>{if(document.getElementById('badge').className.includes('live'))refresh();},10000);
+    </script>
+    </body>
+    </html>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langgraph-ui
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: langgraph-ui
+  template:
+    metadata:
+      labels:
+        app: langgraph-ui
+    spec:
+      containers:
+        - name: langgraph-ui
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              mkdir -p /app &&
+              cp /html/index.html /app/index.html &&
+              cd /app &&
+              python3 -m http.server 8021
+          ports:
+            - containerPort: 8021
+          volumeMounts:
+            - name: html
+              mountPath: /html
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+      volumes:
+        - name: html
+          configMap:
+            name: langgraph-ui-html
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph-ui
+  namespace: openlit-demo
+spec:
+  selector:
+    app: langgraph-ui
+  ports:
+    - port: 8021
+      targetPort: 8021

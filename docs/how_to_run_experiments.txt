@@ -1,0 +1,412 @@
+# How to Run Experiments
+# NOTE (2026-06-12): repo reorganized — manifests now live in deploy/{common,local-k3s,robopaas}/,
+# the measurement script in evaluation/. Paths below have been updated accordingly.
+# Multi-Agent AI Observability Stack — Complete Reference
+# Covers: demo_test.yaml · demo_langgraph.yaml · demo_spectra.yaml
+
+=============================================================================
+0. PREREQUISITES
+=============================================================================
+
+Hardware:     12 GB RAM free, 4+ CPU cores, 25 GB free disk
+Software:     kubectl, helm >= 3.12, git, python3 >= 3.10, curl, bc
+k3s:          curl -sfL https://get.k3s.io | sh -
+kubectl cfg:  export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+Verify cluster is ready:
+  kubectl get nodes
+  # Expected: node shows Ready
+
+Install OpenLIT (one-time, instructor):
+  helm repo add openlit https://openlit.github.io/helm/ && helm repo update
+  helm install openlit openlit/openlit -n openlit --create-namespace
+
+Install Langfuse (one-time, instructor):
+  helm repo add langfuse https://langfuse.github.io/langfuse-k8s && helm repo update
+  helm install langfuse langfuse/langfuse -n langfuse --create-namespace \
+    -f langfuse-storage-values.yaml
+
+Configure Langfuse API key (one-time per cluster):
+  # 1. Open http://localhost:3002 → Settings → API Keys → Create new key pair
+  # 2. Encode: echo -n 'pk-lf-YOUR:sk-lf-YOUR' | base64 -w 0
+  # 3. Edit collector config:
+  kubectl edit configmap otel-collector-config -n openlit-demo
+  # Replace Authorization: Basic ... with the new encoded value
+  kubectl rollout restart deploy/otel-collector -n openlit-demo
+
+
+=============================================================================
+1. DEPLOY THE STACKS
+=============================================================================
+
+Always deploy in this order — demo_test.yaml provides shared services
+(Redis, MongoDB, Flowcept, OTel Collector, Ollama) used by all three demos.
+
+--- Step 1: Base stack (required first) ---
+
+  kubectl apply -f deploy/local-k3s/demo_test.yaml   # (deploy/robopaas/demo_test_robopaas.yaml on the institute cluster)
+  kubectl get pods -n openlit-demo -w
+  # Wait until all pods reach 1/1 Running (2-4 min)
+
+  # Verify tinyllama is pulled:
+  kubectl exec -n openlit-demo deploy/ollama -- ollama list
+  # Expected: tinyllama:latest listed
+
+--- Step 2: LangGraph demo (optional, independent) ---
+
+  kubectl apply -f deploy/common/demo_langgraph.yaml
+  kubectl rollout status deployment/langgraph-agent -n openlit-demo
+  # First boot takes 2-4 min (pip install inside container)
+
+--- Step 3: SPECTRA demo (optional, independent) ---
+
+  kubectl apply -f deploy/common/demo_spectra.yaml
+  kubectl rollout status deployment/spectra-pipeline -n openlit-demo
+  # First boot takes 3-5 min (pip install inside container)
+
+--- Pull Mistral (optional, for model comparison experiment) ---
+
+  # Requires Ollama PVC to be deployed (demo_test.yaml v2+)
+  kubectl exec -n openlit-demo deploy/ollama -- ollama pull mistral
+  # Takes ~5 min on first pull. Survives pod restarts with PVC.
+  kubectl exec -n openlit-demo deploy/ollama -- ollama list
+  # Expected: both tinyllama:latest and mistral:latest
+
+
+=============================================================================
+2. PORT-FORWARDS
+=============================================================================
+
+Run each command in a SEPARATE terminal tab and keep them open.
+Use & to background them in one terminal if preferred.
+
+--- Base demo ---
+  kubectl port-forward svc/flowcept-rest  -n openlit-demo 5000:5000 &
+  kubectl port-forward svc/flowcept-ui    -n openlit-demo 8020:8020 &
+  kubectl port-forward svc/agent-a        -n openlit-demo 8080:8000 &
+
+--- LangGraph demo (needs base running) ---
+  kubectl port-forward svc/langgraph-agent -n openlit-demo 8081:8000 &
+  kubectl port-forward svc/langgraph-ui    -n openlit-demo 8021:8021 &
+
+--- SPECTRA demo (needs base running) ---
+  kubectl port-forward svc/spectra-pipeline -n openlit-demo 8502:8000 &
+  kubectl port-forward svc/spectra-gui      -n openlit-demo 8501:8501 &
+
+--- Shared observability backends (work for all three demos) ---
+  kubectl port-forward svc/jaeger        -n openlit-demo 16686:16686 &
+  kubectl port-forward svc/grafana       -n openlit-demo 3001:3000   &
+  kubectl port-forward svc/prometheus    -n openlit-demo 9090:9090   &
+  kubectl port-forward svc/phoenix       -n openlit-demo 6006:6006   &
+  kubectl port-forward svc/openlit       -n openlit      3000:3000   &
+  kubectl port-forward svc/langfuse-web  -n langfuse     3002:3000   &
+
+
+=============================================================================
+3. TRIGGER PIPELINE RUNS
+=============================================================================
+
+--- Base demo ---
+  curl -s http://localhost:8080/run | python3 -m json.tool
+  # Expected: {"run_id":"...", "status":"ok"}
+
+--- LangGraph demo ---
+  curl -s 'http://localhost:8081/run?topic=quantum+computing' | python3 -m json.tool
+  # Expected: {"run_id":"...", "synthesis":"...", "revisions":N, "validations":N}
+
+  # Force a revision cycle (use short topic):
+  curl -s 'http://localhost:8081/run?topic=x' | python3 -m json.tool
+
+--- SPECTRA demo (text document) ---
+  curl -s 'http://localhost:8502/run?document=AI+observability+in+distributed+systems' \
+    | python3 -m json.tool
+  # Expected: {"status":"ok","run_id":"...",
+  #   "summary":{"layer1_records":15,"layer2_events":28,"causal_edges":27,
+  #              "goal_failed":1,"goal_failed_agents":["impact_agent"],
+  #              "dual_layer_contrast":true,"synthesis":"..."}}
+
+--- SPECTRA demo (PDF document) ---
+  # ⚠ IMPORTANT: /data/ is an emptyDir volume — it is WIPED on every pod restart.
+  #   You must re-copy the PDF after every kubectl rollout restart or pod crash.
+
+  # 1. Find the running pod name:
+  kubectl get pods -n openlit-demo | grep spectra-pipeline
+  # Example output: spectra-pipeline-76865d74d-f689l
+
+  # 2. Copy PDF into the pod (replace <pod-name> with actual name):
+  kubectl cp ./paper.pdf openlit-demo/<pod-name>:/data/paper.pdf -c spectra-pipeline
+
+  # 3. Verify it arrived:
+  kubectl exec -n openlit-demo <pod-name> -c spectra-pipeline -- ls -lh /data/paper.pdf
+
+  # 4. Trigger with PDF:
+  curl -s 'http://localhost:8502/run?pdf=/data/paper.pdf' | python3 -m json.tool
+
+  # 5. After any redeployment, re-copy the PDF:
+  #    kubectl apply -f deploy/common/demo_spectra.yaml
+  #    kubectl rollout restart deployment/spectra-pipeline -n openlit-demo
+  #    POD=$(kubectl get pods -n openlit-demo | grep spectra-pipeline | awk '{print $1}')
+  #    kubectl cp ./paper.pdf openlit-demo/$POD:/data/paper.pdf -c spectra-pipeline
+
+  # NOTE: The label selector app=spectra-pipeline may not work with jsonpath.
+  #   Use: kubectl get pods -n openlit-demo | grep spectra | awk '{print $1}'
+  #   to get the pod name reliably.
+
+--- Switch SPECTRA model ---
+  # To Mistral (richer output, ~30-90s per run):
+  kubectl set env deployment/spectra-pipeline -n openlit-demo OLLAMA_MODEL=mistral
+  kubectl rollout restart deployment/spectra-pipeline -n openlit-demo
+  kubectl rollout status deployment/spectra-pipeline -n openlit-demo
+
+  # Back to tinyllama (faster, ~5-10s per run):
+  kubectl set env deployment/spectra-pipeline -n openlit-demo OLLAMA_MODEL=tinyllama
+  kubectl rollout restart deployment/spectra-pipeline -n openlit-demo
+
+
+=============================================================================
+4. UI ENDPOINTS
+=============================================================================
+
+  URL                       Tool              Purpose
+  ─────────────────────────────────────────────────────────────────────────
+  http://localhost:8020     Flowcept UI       Base demo provenance graph
+  http://localhost:8021     LangGraph UI      5-swimlane prov graph + revision cycles
+  http://localhost:8501     SPECTRA GUI       4-tab dual-layer viewer
+  http://localhost:5000/docs Flowcept REST    Swagger API for provenance queries
+  http://localhost:3000     OpenLIT           Token counts, cost, LLM latency
+  http://localhost:16686    Jaeger            Distributed trace waterfall
+  http://localhost:3001     Grafana           OTel collector metrics (admin/admin)
+  http://localhost:9090     Prometheus        Raw PromQL queries
+  http://localhost:6006     Arize Phoenix     Embeddings, LLM-as-judge evals
+  http://localhost:3002     Langfuse          Full prompt/response, evaluations
+
+  Flowcept UI connection:
+    REST API field = http://localhost:5000/api/v1
+    PROV-AGENT field = http://localhost:5000
+
+
+=============================================================================
+5. VERIFY EACH DEMO
+=============================================================================
+
+--- Base demo checks ---
+  # Runs trigger successfully:
+  curl http://localhost:8080/run
+  # Provenance records appear:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval 'db.tasks.countDocuments({})' --quiet
+  # Open http://localhost:8020 → Connect → Prov graph shows 3 swimlanes
+
+--- LangGraph demo checks ---
+  # Run returns synthesis:
+  curl -s 'http://localhost:8081/run?topic=climate' | python3 -m json.tool
+  # Provenance records tagged langgraph:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval \
+    'db.tasks.countDocuments({"custom_metadata.framework":"langgraph"})' --quiet
+  # Expected: >= 5 (one per node)
+  # Open http://localhost:8021 → Connect → Prov graph shows 5 swimlanes
+
+--- SPECTRA demo checks ---
+  # Run returns dual_layer_contrast:true:
+  curl -s 'http://localhost:8502/run?document=test' | \
+    python3 -c "import sys,json; d=json.load(sys.stdin); print(d['summary']['dual_layer_contrast'])"
+  # Expected: True
+
+  # Layer 1 records in MongoDB:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval \
+    'db.tasks.countDocuments({"custom_metadata.framework":"spectra"})' --quiet
+  # Expected: >= 15 per run (5 AgentTool + 5 LLM invocations + 5 RUNNING)
+
+  # Open http://localhost:8501 → Tab 2 (Causal DAG) shows:
+  #   28 events, 27 edges, GOAL_FAILED for impact_agent
+  # Dual-layer contrast banner should appear at top of page
+
+
+=============================================================================
+6. PERFORMANCE MEASUREMENT EXPERIMENT
+=============================================================================
+
+Run spectra_measure.sh to collect data for the research paper evaluation.
+Results are tagged by model name in MongoDB for clean comparison.
+
+--- tinyllama (fast — ~15 min for 10 runs) ---
+  kubectl set env deployment/spectra-pipeline -n openlit-demo OLLAMA_MODEL=tinyllama
+  kubectl rollout restart deployment/spectra-pipeline -n openlit-demo
+  kubectl rollout status deployment/spectra-pipeline -n openlit-demo
+
+  chmod +x spectra_measure.sh
+  ./spectra_measure.sh tinyllama 10 2>&1 | tee results/local/results_tinyllama_50.txt
+
+--- Mistral 7B (slower — ~20-30 min for 10 runs) ---
+  # Pull first if not already done:
+  kubectl exec -n openlit-demo deploy/ollama -- ollama pull mistral
+
+  kubectl set env deployment/spectra-pipeline -n openlit-demo OLLAMA_MODEL=mistral
+  kubectl rollout restart deployment/spectra-pipeline -n openlit-demo
+  kubectl rollout status deployment/spectra-pipeline -n openlit-demo
+
+  ./spectra_measure.sh mistral 10 2>&1 | tee results/local/results_mistral_50.txt
+
+--- After both complete ---
+  # Paste results_tinyllama.txt and results_mistral.txt to Claude
+  # to update the research paper with real numbers.
+
+--- Query results manually ---
+  # Compare mean agent duration across models:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- mongosh flowcept --quiet --eval "
+    ['tinyllama','mistral'].forEach(m => {
+      print('=== ' + m + ' ===');
+      ['ingestion_agent','analysis_agent','impact_agent','citation_agent','synthesis_agent']
+        .forEach(a => {
+          var recs = db.tasks.find(
+            {activity_id:a, subtype:'agent_task', status:'FINISHED',
+             'custom_metadata.model':m},
+            {started_at:1, ended_at:1}
+          ).toArray();
+          var durs = recs.map(r => r.ended_at - r.started_at).filter(d => d > 0);
+          if (durs.length > 0) {
+            var mean = durs.reduce((a,b)=>a+b,0) / durs.length;
+            print(a + ': n=' + durs.length + ' mean=' + mean.toFixed(2) + 's');
+          }
+        });
+    });
+  "
+
+  # Count silent failures per model:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- mongosh flowcept --quiet --eval "
+    ['tinyllama','mistral'].forEach(m => {
+      var total = db.tasks.countDocuments(
+        {activity_id:'impact_agent', subtype:'agent_task', 'custom_metadata.model':m}
+      );
+      var fallback = db.tasks.countDocuments(
+        {activity_id:'impact_agent', subtype:'agent_task', 'custom_metadata.model':m,
+         'generated.fallback': true}
+      );
+      print(m + ': impact_agent fallback=' + fallback + '/' + total +
+            ' (' + (fallback/Math.max(total,1)*100).toFixed(0) + '%)');
+    });
+  "
+
+
+=============================================================================
+7. USEFUL COMMANDS
+=============================================================================
+
+--- Logs ---
+  kubectl logs -n openlit-demo deploy/langgraph-agent -f
+  kubectl logs -n openlit-demo deployment/spectra-pipeline -c spectra-pipeline -f
+  kubectl logs -n openlit-demo deployment/spectra-pipeline -c spectra-gui -f
+  kubectl logs -n openlit-demo deploy/flowcept-consumer -f
+
+--- MongoDB queries ---
+  # Open interactive shell:
+  kubectl exec -it -n openlit-demo deploy/flowcept-mongodb -- mongosh flowcept
+
+  # Count all tasks:
+  db.tasks.countDocuments({})
+
+  # List distinct frameworks:
+  db.tasks.distinct("custom_metadata.framework")
+
+  # View last 3 SPECTRA runs:
+  db.tasks.find({"custom_metadata.framework":"spectra"}).sort({started_at:-1}).limit(3).pretty()
+
+  # View last LangGraph run with revision cycle (researcher appears twice):
+  db.tasks.find({"custom_metadata.framework":"langgraph",activity_id:"researcher"}).pretty()
+
+--- Clear data ---
+  # Clear base demo tasks only:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval 'db.tasks.deleteMany({"custom_metadata.framework":{$exists:false}})' --quiet
+
+  # Clear LangGraph tasks only:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval 'db.tasks.deleteMany({"custom_metadata.framework":"langgraph"})' --quiet
+
+  # Clear SPECTRA tasks for one model:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval 'db.tasks.deleteMany({"custom_metadata.model":"tinyllama"})' --quiet
+
+  # Clear ALL tasks (use with care):
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval 'db.tasks.drop()' --quiet
+
+--- Restart deployments ---
+  kubectl rollout restart deployment/flowcept-rest -n openlit-demo
+  kubectl rollout restart deployment/langgraph-agent deployment/langgraph-ui -n openlit-demo
+  kubectl rollout restart deployment/spectra-pipeline -n openlit-demo
+
+--- Full redeployment (preserves base stack) ---
+  kubectl delete -f deploy/common/demo_langgraph.yaml; kubectl apply -f deploy/common/demo_langgraph.yaml
+  kubectl delete -f deploy/common/demo_spectra.yaml;   kubectl apply -f deploy/common/demo_spectra.yaml
+
+--- Check resource usage ---
+  kubectl top pods -n openlit-demo
+  kubectl top nodes
+
+
+=============================================================================
+8. PROV-AGENT QUICK QUERY REFERENCE
+=============================================================================
+
+Open Flowcept UI → PROV-AGENT chat, or POST to http://localhost:5000/api/v1/query
+
+  Query                                    Returns
+  ──────────────────────────────────────────────────────────────────────────
+  "which agent took longest on average?"   Agent name + avg duration
+  "what inputs did researcher receive?"    used field for all researcher tasks
+  "how many tasks ran in the last run?"    Count grouped by workflow_id
+  "show failed tasks and their inputs"     ERROR status tasks + used field
+  "generate_workflow_provenance_card"      Formatted provenance summary
+
+  Via curl:
+  curl -s -X POST http://localhost:5000/api/v1/query \
+    -H 'Content-Type: application/json' \
+    -d '{"question":"which agent took longest on average?"}' \
+    | python3 -m json.tool
+
+
+=============================================================================
+9. TROUBLESHOOTING
+=============================================================================
+
+Pod stuck in Pending:
+  kubectl describe pod <pod-name> -n openlit-demo
+  # If PVC error: check storage class
+  kubectl get pvc -n openlit-demo
+
+Pod in CrashLoopBackOff:
+  kubectl logs -n openlit-demo <pod-name> --previous
+  # ModuleNotFoundError → pip install failed, wait or restart
+  # OOMKilled → increase memory limit in YAML
+  # Connection refused → check dependency pod is running
+
+SPECTRA GUI shows no data:
+  # Check MongoDB directly:
+  kubectl exec -n openlit-demo deploy/flowcept-mongodb -- \
+    mongosh flowcept --eval \
+    'db.tasks.countDocuments({"custom_metadata.framework":"spectra"})' --quiet
+  # If 0: trigger a run first → curl http://localhost:8502/run
+
+SPECTRA dual-layer contrast banner missing:
+  kubectl logs -n openlit-demo deployment/spectra-pipeline \
+    -c spectra-pipeline | grep -E "GOAL_FAILED|Layer1|fallback"
+  # Should see: [Layer1] Saved impact_agent (FINISHED) AND a GOAL_FAILED event
+
+LangGraph run selector shows wrong count:
+  # Ensure updated rest_api.py (workflow_id grouping) is deployed:
+  kubectl apply -f deploy/local-k3s/demo_test.yaml   # (deploy/robopaas/demo_test_robopaas.yaml on the institute cluster)
+  kubectl rollout restart deployment/flowcept-rest -n openlit-demo
+
+Ollama out of memory with Mistral:
+  # Check memory limit in demo_test.yaml Ollama deployment (needs 6Gi for Mistral)
+  kubectl describe pod -n openlit-demo -l app=ollama | grep -A5 Limits
+  # Increase if needed and redeploy
+
+Port-forward connection refused:
+  # Check the service exists:
+  kubectl get svc -n openlit-demo | grep <service-name>
+  # Check the pod is running:
+  kubectl get pods -n openlit-demo | grep <app-name>

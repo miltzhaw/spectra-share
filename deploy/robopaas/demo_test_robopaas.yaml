@@ -1,0 +1,2608 @@
+# =============================================================================
+# MULTI-AGENT OBSERVABILITY DEMO — base stack, ROBOPAAS (GPU institute cluster)
+# Stack: OpenLIT · Jaeger · Prometheus · Grafana · Langfuse · Phoenix · Flowcept
+# Repo path:  deploy/robopaas/demo_test_robopaas.yaml
+# Kubeconfig: export KUBECONFIG=~/.kube/robopaas-config.yaml
+#
+# COMPONENTS DEPLOYED BY THIS FILE
+#   otel-collector     — OTLP receiver, fans out traces/metrics to all backends
+#   jaeger             — distributed trace waterfall UI
+#   prometheus         — metrics store
+#   grafana            — unified dashboard (Prometheus + Jaeger datasources)
+#   minio              — S3-compatible storage for Langfuse event uploads
+#   phoenix            — Arize Phoenix LLM observability UI
+#   ollama             — GPU LLM inference on an NVIDIA A30 (24GB), pinned to
+#                        node gpu-3 via runtimeClassName: nvidia (the cluster's
+#                        device plugin registers no nvidia.com/gpu, so GPU
+#                        access goes through the runtime class). Model ladder on
+#                        an 80Gi PVC: tinyllama, mistral, llama3.1:8b,
+#                        qwen2.5:32b. OLLAMA_CONTEXT_LENGTH=4096 so 32B fits.
+#   flowcept-redis     — message broker for the Flowcept provenance stream
+#   flowcept-mongodb   — W3C PROV-compliant provenance store
+#   flowcept-consumer  — Redis → MongoDB pipeline worker
+#   flowcept-agent     — unified REST API + natural-language provenance query server
+#   flowcept-rest      — read-only structured REST query API (Swagger at /docs)
+#   flowcept-ui        — Provenance Dashboard web UI
+#   agent-a/b/c        — demo multi-agent application (OTel + Flowcept instrumented)
+#
+# DEPLOYED SEPARATELY
+#   OpenLIT    — Helm into namespace "openlit"
+#   Langfuse   — Helm into namespace "langfuse" (see langfuse-storage-values.yaml)
+#
+# RELATED FILES (repo layout: deploy/{common,local-k3s,robopaas}/)
+#   This is the GPU BASE stack for robopaas. Apply the demos on top (portable):
+#     deploy/common/demo_spectra.yaml     — SPECTRA dual-layer pipeline + GUI
+#         (trigger: port-forward svc/spectra-pipeline 8504:8000, then
+#          curl 'http://localhost:8504/run?document=hello')
+#     deploy/common/demo_langgraph.yaml   — LangGraph 5-agent demo
+#   Local (CPU) base stack: deploy/local-k3s/demo_test.yaml
+#
+# PORT-FORWARD CHEATSHEET (run each in its own terminal)
+#   kubectl port-forward svc/agent-a        -n openlit-demo 8080:8000
+#   kubectl port-forward svc/jaeger         -n openlit-demo 16686:16686
+#   kubectl port-forward svc/prometheus     -n openlit-demo 9090:9090
+#   kubectl port-forward svc/grafana        -n openlit-demo 3001:3000
+#   kubectl port-forward svc/openlit        -n openlit      3000:3000
+#   kubectl port-forward svc/langfuse-web   -n langfuse     3002:3000
+#   kubectl port-forward svc/minio          -n openlit-demo 9001:9001
+#   kubectl port-forward svc/phoenix        -n openlit-demo 6006:6006
+#   kubectl port-forward svc/flowcept-ui    -n openlit-demo 8020:8020
+#   kubectl port-forward svc/flowcept-rest  -n openlit-demo 5000:5000
+#
+# QUICK START
+#   1. Deploy:      kubectl apply -f deploy/robopaas/demo_test_robopaas.yaml
+#   2. Wait ~3min for pip installs and ollama pull to complete
+#   3. Port-forward the services you need (see above)
+#   4. Trigger a run:  curl http://localhost:8080/run
+#   5. Open UI:     http://localhost:8020
+#   6. Open docs:   http://localhost:5000/docs
+#   7. Query PROV:  curl -s -X POST http://localhost:5000/api/v1/query \
+#                        -H "Content-Type: application/json" \
+#                        -d '{"question": "which agent took longest on average?"}'
+#
+# AFTER DEPLOYMENT — redeployment workflow
+#   kubectl apply -f deploy/robopaas/demo_test_robopaas.yaml
+#   kubectl rollout restart deployment/agent-a deployment/agent-b deployment/agent-c \
+#     deployment/flowcept-rest deployment/flowcept-agent deployment/flowcept-consumer \
+#     deployment/flowcept-ui -n openlit-demo
+#   # Clear old provenance data (optional):
+#   kubectl exec -n openlit-demo deployment/flowcept-mongodb -- \
+#     mongosh flowcept --eval "db.tasks.drop()"
+# =============================================================================
+
+
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openlit-demo
+
+---
+# =============================================================================
+# Flowcept settings.yaml — configures Redis + MongoDB for all pods
+# Mounted at /root/.flowcept/settings.yaml in every agent and flowcept pod.
+# Flowcept reads this file at startup; env vars alone are not sufficient.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowcept-settings
+  namespace: openlit-demo
+data:
+  settings.yaml: |
+    project: 
+      debug: false
+      db_flush_mode: online
+      enrich_messages: false
+    mq:
+      enabled: true
+      type: redis
+      host: flowcept-redis
+      port: 6379
+      channel: interception
+      buffer_size: 1
+      insertion_buffer_time_secs: 1
+      same_as_kvdb: false
+    kv_db:
+      enabled: true
+      host: flowcept-redis
+      port: 6379
+    databases:
+      mongodb:
+        enabled: true
+        host: flowcept-mongodb
+        port: 27017
+        db: flowcept
+        create_collection_index: true
+    agent:
+      enabled: true
+      mcp_host: 0.0.0.0
+      mcp_port: 8096
+      start_persistence_daemon: true
+
+---
+# =============================================================================
+# OTel Collector — ConfigMap
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: openlit-demo
+data:
+  otel-collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 512
+
+      # 1. ADDED: Transform processor to inject missing LLM metadata
+      transform:
+        error_mode: ignore
+        trace_statements:
+          - context: span
+            statements:
+              # Only inject Langfuse metadata if the span is an actual LLM/GenAI call
+              - set(attributes["langfuse.observation.type"], "generation") where attributes["gen_ai.system"] != nil
+              
+              # Safely handle model attributes
+              - set(attributes["llm.model"], attributes["gen_ai.request.model"]) where attributes["gen_ai.request.model"] != nil
+              
+              # Standardize provider taxonomy cleanly without blind overwrites
+              - set(attributes["llm.provider"], attributes["gen_ai.system"]) where attributes["gen_ai.system"] != nil
+              - set(attributes["llm.provider"], "ollama") where attributes["llm.provider"] == nil
+              - set(attributes["gen_ai.system"], "ollama") where attributes["gen_ai.system"] == nil
+              
+    exporters:
+      debug:
+        verbosity: basic
+
+      # ── OpenLIT ──────────────────────────────────────────────────────
+      otlphttp/openlit:
+        endpoint: "http://openlit.openlit.svc.cluster.local:4318"
+        tls:
+          insecure: true
+
+      # ── Jaeger ───────────────────────────────────────────────────────
+      otlp/jaeger:
+        endpoint: "jaeger:14317"
+        tls:
+          insecure: true
+
+      # ── Prometheus ───────────────────────────────────────────────────
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+
+      # ── Langfuse ─────────────────────────────────────────────────────
+      # Update Authorization with your base64(pk-lf-...:sk-lf-...) key
+      # See setup guide at the bottom of this file.
+      otlphttp/langfuse:
+        endpoint: "http://langfuse-web.langfuse.svc.cluster.local:3000/api/public/otel"
+        headers:
+          Authorization: "Basic ${LANGFUSE_AUTH_B64}"
+        tls:
+          insecure: true
+
+      # ── Arize Phoenix ────────────────────────────────────────────────
+      otlp/phoenix:
+        endpoint: "http://phoenix:4317"
+        tls:
+          insecure: true
+
+    service:
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888   # collector's own internal metrics for Prometheus
+
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch, transform]
+          # ╔══════════════════════════════════════════════════════════════╗
+          # ║  LANGFUSE IS DISABLED BY DEFAULT                            ║
+          # ║  otlphttp/langfuse is intentionally absent from this list.  ║
+          # ║  To enable: complete Step 6 of the setup guide (generate    ║
+          # ║  API keys, update the Authorization header above, then      ║
+          # ║  add otlphttp/langfuse to the exporters list below).        ║
+          # ╚══════════════════════════════════════════════════════════════╝
+          exporters: [debug, otlphttp/openlit, otlp/jaeger, otlp/phoenix, otlphttp/langfuse]
+
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug, otlphttp/openlit, prometheus]
+          
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug, otlphttp/openlit]
+
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.104.0
+          args: ["--config=/etc/otel.yaml"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel.yaml
+              subPath: otel-collector-config.yaml
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: prom-agents
+              containerPort: 8889
+            - name: prom-self
+              containerPort: 8888
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: openlit-demo
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: prom-agents
+      port: 8889
+      targetPort: 8889
+    - name: prom-self
+      port: 8888
+      targetPort: 8888
+
+
+---
+# =============================================================================
+# MinIO — S3-compatible storage for Langfuse event uploads
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio:latest
+        args: ["server", "/data", "--console-address", ":9001"]
+        env:
+        - name: MINIO_ROOT_USER
+          value: "langfuse"
+        - name: MINIO_ROOT_PASSWORD
+          value: "${MINIO_SECRET_KEY}"
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5 && mkdir  -p /data/langfuse-otel && echo 'bucket ready'"]
+        ports:
+        - containerPort: 9000
+        - containerPort: 9001
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: openlit-demo
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+      
+---
+# =============================================================================
+# Jaeger — all-in-one (in-memory storage, suitable for demo)
+# UI at http://localhost:16686 (after port-forward)
+#
+# so there is no port collision with the OTel Collector Service.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.57
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - name: ui
+              containerPort: 16686
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: openlit-demo
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: 16686
+    - name: otlp-grpc
+      port: 14317          # external 14317 → Jaeger internal 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 14318          # external 14318 → Jaeger internal 4318
+      targetPort: 4318
+
+---
+# =============================================================================
+# Prometheus — scrapes collector metrics
+# UI at http://localhost:9090 (after port-forward)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: openlit-demo
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      # Collector internal pipeline metrics (otelcol_exporter_sent_spans etc.)
+      - job_name: "otel-collector-internal"
+        static_configs:
+          - targets: ["otel-collector:8888"]
+
+      # Agent/AI metrics forwarded through the prometheus exporter
+      - job_name: "otel-collector-agents"
+        static_configs:
+          - targets: ["otel-collector:8889"]
+
+      # Jaeger internal metrics
+      - job_name: "jaeger"
+        static_configs:
+          - targets: ["jaeger:16686"]
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: openlit-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openlit-demo-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, endpoints]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openlit-demo-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openlit-demo-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: openlit-demo
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.52.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.retention.time=3d"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          ports:
+            - containerPort: 9090
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "200m"
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: openlit-demo
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+
+---
+# =============================================================================
+# Grafana — datasources (auto-provisioned on startup, no manual UI setup)
+# UI at http://localhost:3001 — login: admin / admin
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: openlit-demo
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: true
+
+      - name: Jaeger
+        type: jaeger
+        access: proxy
+        url: http://jaeger:16686
+        editable: true
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-config
+  namespace: openlit-demo
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: multi-agent-demo
+        folder: Multi-Agent Demo
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+
+---
+# =============================================================================
+# Grafana — Multi-Agent Overview Dashboard
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-multiagent
+  namespace: openlit-demo
+data:
+  multi-agent-overview.json: |
+    {
+      "title": "Multi-Agent Demo Overview",
+      "uid": "multiagent-overview",
+      "schemaVersion": 38,
+      "time": { "from": "now-30m", "to": "now" },
+      "refresh": "10s",
+      "panels": [
+        {
+          "id": 1, "type": "stat",
+          "title": "Spans → OpenLIT (last 5m)",
+          "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "increase(otelcol_exporter_sent_spans{exporter=\"otlphttp/openlit\"}[5m])" }],
+          "options": { "colorMode": "background", "graphMode": "area" }
+        },
+        {
+          "id": 2, "type": "stat",
+          "title": "Spans → Jaeger (last 5m)",
+          "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "increase(otelcol_exporter_sent_spans{exporter=\"otlp/jaeger\"}[5m])" }],
+          "options": { "colorMode": "background", "graphMode": "area" }
+        },
+        {
+          "id": 3, "type": "stat",
+          "title": "Spans → Langfuse (last 5m)",
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "increase(otelcol_exporter_sent_spans{exporter=\"otlphttp/langfuse\"}[5m])" }],
+          "options": { "colorMode": "background" }
+        },
+        {
+          "id": 4, "type": "stat",
+          "title": "Export Failures (last 5m)",
+          "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "sum(otelcol_exporter_send_failed_spans)" }],
+          "options": { "colorMode": "background",
+            "thresholds": { "steps": [{"color":"green","value":0},{"color":"red","value":1}] } }
+        },
+        {
+          "id": 5, "type": "timeseries",
+          "title": "Span export rate per backend (spans/s)",
+          "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "otelcol_exporter_sent_spans",
+            "legendFormat": "{{ exporter }}" }]
+        },
+        {
+          "id": 6, "type": "timeseries",
+          "title": "Spans received by collector (spans/s)",
+          "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "otelcol_receiver_accepted_spans",
+            "legendFormat": "{{ receiver }}" }]
+        },
+        {
+          "id": 7, "type": "timeseries",
+          "title": "Collector memory (MB)",
+          "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+          "targets": [{ "datasource": "Prometheus",
+            "expr": "otelcol_process_memory_rss / 1024 / 1024",
+            "legendFormat": "RSS MB" }]
+        }
+      ]
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:10.4.3
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: "admin"
+            - name: GF_FEATURE_TOGGLES_ENABLE
+              value: "traceqlEditor"
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboards-config
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboards-config
+          configMap:
+            name: grafana-dashboards-config
+        - name: dashboards
+          configMap:
+            name: grafana-dashboard-multiagent
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: openlit-demo
+spec:
+  selector:
+    app: grafana
+  ports:
+    - port: 3000
+      targetPort: 3000
+
+---
+# =============================================================================
+# Agent A — entry point, calls Agent B with W3C traceparent propagation
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-a
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-a
+  template:
+    metadata:
+      labels:
+        app: agent-a
+    spec:
+      containers:
+        - name: agent-a
+          image: python:3.10-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn requests openlit opentelemetry-sdk opentelemetry-exporter-otlp pytz pandas numpy lmdb psutil py-cpuinfo pymongo redis gitpython && pip install --no-cache-dir "flowcept[mongo]"
+              
+              cat <<'PY' > /app.py
+              import os, json, sys, time, redis, requests
+              os.environ["OTEL_SERVICE_NAME"] = "agent-a"
+              os.environ["OPENLIT_APPLICATION_NAME"] = "multi-agent-demo"
+              
+              import openlit
+              from fastapi import FastAPI, Request
+              from opentelemetry import trace
+              from opentelemetry.propagate import inject, extract
+              
+              openlit.init()
+              app = FastAPI()
+              tracer = trace.get_tracer("agent-a")
+              r_client = redis.Redis(host="flowcept-redis", port=6379, decode_responses=True)
+              
+              @app.get("/run")
+              def run(request: Request):
+                  import uuid
+                  print("LOG [Agent A]: /run endpoint triggered", flush=True)
+                  ctx = extract(dict(request.headers))
+                  with tracer.start_as_current_span("agent-a.run", context=ctx):
+                      headers = {}
+                      inject(headers)
+                      
+                      run_id = str(uuid.uuid4())[:8]
+                      start_time = time.time()
+                      
+                      print("LOG [Agent A]: Directing payload request to agent-b with 60s timeout...", flush=True)
+                      try:
+                          resp = requests.post("http://agent-b:8000/plan",
+                                             json={"task": "hello from agent-a", "run_id": run_id},
+                                             headers=headers,
+                                             timeout=60)
+                          result = resp.json()
+                      except Exception as req_err:
+                          print(f"LOG ERROR [Agent A]: Outbound call failed or timed out: {req_err}", flush=True)
+                          result = {"error": str(req_err)}
+                      
+                      task_record = {
+                          "activity_id": "agent_a_run",
+                          "workflow_id": run_id,
+                          "custom_metadata": {"agent": "agent-a"},
+                          "used": {"task": "hello from agent-a"},
+                          "generated": result,
+                          "started_at": start_time,
+                          "ended_at": time.time(),
+                          "status": "ERROR" if "error" in result else "FINISHED"
+                      }
+                      try:
+                          r_client.rpush("interception", json.dumps(task_record))
+                      except Exception: pass
+                          
+                      return result
+              PY
+              python3 -u -m uvicorn app:app --host 0.0.0.0 --port 8000
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FLOWCEPT_SETTINGS_PATH
+              value: "/root/.flowcept/settings.yaml"
+            - name: OTEL_SERVICE_NAME
+              value: "agent-a"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.openlit-demo.svc.cluster.local:4318"
+            - name: OPENLIT_APPLICATION_NAME
+              value: "multi-agent-demo"
+            - name: OPENLIT_ENVIRONMENT
+              value: "dev"      
+            - name: OPENLIT_PRICING_JSON
+              value: '{"tinyllama": {"prompt_token": 0.10, "completion_token": 0.10}}'
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "300m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-a
+  namespace: openlit-demo
+spec:
+  selector:
+    app: agent-a
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: NodePort
+
+---
+# =============================================================================
+# Agent B — planner, calls Ollama (tinyllama) then forwards to Agent C
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-b
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-b
+  template:
+    metadata:
+      labels:
+        app: agent-b
+    spec:
+      containers:
+        - name: agent-b
+          image: python:3.10-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn requests openai openlit langfuse opentelemetry-sdk opentelemetry-exporter-otlp pytz pandas numpy lmdb psutil py-cpuinfo pymongo redis gitpython && pip install --no-cache-dir "flowcept[mongo]"
+              
+              cat <<'PY' > /app.py
+              import os, json, sys, time, redis, requests, openai
+              os.environ["OTEL_SERVICE_NAME"] = "agent-b"
+              os.environ["OPENLIT_APPLICATION_NAME"] = "multi-agent-demo"
+              
+              import openlit
+              # Import the Langfuse automatic wrapper
+              from langfuse.openai import openai as langfuse_openai
+              from fastapi import FastAPI, Request
+              from opentelemetry import trace
+              from opentelemetry.propagate import inject, extract
+              
+              openlit.init()
+              app = FastAPI()
+              tracer = trace.get_tracer("agent-b")
+              r_client = redis.Redis(host="flowcept-redis", port=6379, decode_responses=True)
+              
+              @app.post("/plan")
+              def plan(data: dict, request: Request):
+                  print("LOG [Agent B]: /plan endpoint triggered", flush=True)
+                  run_id = data.get("run_id", "unknown")
+                  ctx = extract(dict(request.headers))
+                  with tracer.start_as_current_span("agent-b.plan", context=ctx, attributes={"llm.provider": "ollama", "llm.model": "tinyllama"}):
+                      
+                      start_llm = time.time()
+                      
+                      client = langfuse_openai.OpenAI(
+                          api_key="ollama", 
+                          base_url="http://ollama:11434/v1"
+                      )
+                      
+                      print("LOG [Agent B]: Calling Ollama inference backend stream...", flush=True)
+                      response_stream = client.chat.completions.create(
+                          model="tinyllama",
+                          messages=[{"role": "user", "content": data["task"]}],
+                          max_tokens=150,
+                          stream=True,
+                          stream_options={"include_usage": True},
+                          # Tag the dashboard trace metadata dynamically
+                          name="agent-b-planning-task",
+                          metadata={"environment": "dev", "agent": "agent-b"}
+                      )
+                      
+                      plan_text = ""
+                      p_tokens = 0
+                      c_tokens = 0
+                      
+                      for chunk in response_stream:
+                          if chunk.choices and len(chunk.choices) > 0:
+                              delta = chunk.choices[0].delta.content
+                              if delta:
+                                  plan_text += delta
+                          
+                          if hasattr(chunk, 'usage') and chunk.usage is not None:
+                              p_tokens = chunk.usage.prompt_tokens
+                              c_tokens = chunk.usage.completion_tokens
+                              
+                      end_llm = time.time()
+                      
+                      if p_tokens == 0 or c_tokens == 0:
+                          p_tokens = max(1, len(data["task"]) // 4)
+                          c_tokens = max(1, len(plan_text) // 4)
+                          print(f"LOG [Agent B]: Applied fallback estimation (Prompt: {p_tokens}, Completion: {c_tokens})", flush=True)
+                      else:
+                          print(f"LOG [Agent B]: Tracked stream metadata metrics (Prompt: {p_tokens}, Completion: {c_tokens})", flush=True)
+                      
+                      primitive_task_llm = {
+                          "activity_id": "call_llm",
+                          "workflow_id": run_id,
+                          "custom_metadata": {"agent": "agent-b"},
+                          "used": {"task": data["task"]},
+                          "generated": {"response": plan_text},
+                          "started_at": start_llm,
+                          "ended_at": end_llm,
+                          "status": "SUBMITTED"
+                      }
+                      try:
+                          r_client.rpush("interception", json.dumps(primitive_task_llm))
+                      except Exception: pass
+
+                      start_c = time.time()
+                      headers = {}
+                      inject(headers)
+                      
+                      print("LOG [Agent B]: Forwarding plan to Agent C with 60s timeout...", flush=True)
+                      try:
+                          res_c = requests.post("http://agent-c:8000/execute",
+                                               json={"plan": plan_text, "run_id": run_id},
+                                               headers=headers,
+                                               timeout=60)
+                          result = res_c.json()
+                      except Exception as c_err:
+                          print(f"LOG ERROR [Agent B]: Agent C call dropped: {c_err}", flush=True)
+                          result = {"error": str(c_err)}
+                          
+                      primitive_task_c = {
+                          "activity_id": "call_agent_c",
+                          "workflow_id": run_id,
+                          "custom_metadata": {"agent": "agent-b"},
+                          "used": {"plan": plan_text},
+                          "generated": result,
+                          "started_at": start_c,
+                          "ended_at": time.time(),
+                          "status": "ERROR" if "error" in result else "FINISHED",
+                          "exception": result.get("error")
+                      }
+                      try:
+                          r_client.rpush("interception", json.dumps(primitive_task_c))
+                      except Exception: pass
+                      
+                      return result
+              PY
+              python3 -u -m uvicorn app:app --host 0.0.0.0 --port 8000
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FLOWCEPT_SETTINGS_PATH
+              value: "/root/.flowcept/settings.yaml"
+            - name: GIT_PYTHON_REFRESH
+              value: "quiet"
+            - name: OTEL_SERVICE_NAME
+              value: agent-b
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.openlit-demo.svc.cluster.local:4318"
+            - name: OPENLIT_APPLICATION_NAME
+              value: multi-agent-demo
+            - name: OPENLIT_ENVIRONMENT
+              value: dev
+            - name: OPENLIT_PRICING_JSON
+              value: '{"tinyllama": {"prompt_token": 0.10, "completion_token": 0.10}}'
+            - name: OPENAI_API_KEY
+              value: "ollama"
+            - name: OPENAI_BASE_URL
+              value: "http://ollama:11434/v1"
+            - name: OLLAMA_MODEL
+              value: "tinyllama"
+              
+            # Langfuse receives traces via the OTel Collector (otel-collector-config ConfigMap).
+            # The LANGFUSE_HOST env var is intentionally absent here — the Langfuse SDK
+            # should NOT export directly from the agent. All telemetry goes through the
+            # collector's otlphttp/langfuse exporter. Remove these keys if present.
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "300m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-b
+  namespace: openlit-demo
+spec:
+  selector:
+    app: agent-b
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# =============================================================================
+# Agent C — executor, runs the plan from Agent B
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-c
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-c
+  template:
+    metadata:
+      labels:
+        app: agent-c
+    spec:
+      containers:
+        - name: agent-c
+          image: python:3.10-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn gitpython openlit opentelemetry-sdk opentelemetry-exporter-otlp pytz pandas numpy lmdb psutil py-cpuinfo pymongo redis && pip install --no-cache-dir "flowcept[mongo]"
+              
+              cat <<'PY' > /app.py
+              import os, json, sys, time, redis
+              os.environ["OTEL_SERVICE_NAME"] = "agent-c"
+              os.environ["OPENLIT_APPLICATION_NAME"] = "multi-agent-demo"
+              
+              import openlit
+              from fastapi import FastAPI, Request
+              from opentelemetry import trace
+              from opentelemetry.propagate import extract
+              
+              openlit.init()
+              app = FastAPI()
+              tracer = trace.get_tracer("agent-c")
+              r_client = redis.Redis(host="flowcept-redis", port=6379, decode_responses=True)
+              
+              @app.post("/execute")
+              def execute(data: dict, request: Request):
+                  print("LOG [Agent C]: /execute endpoint triggered", flush=True)
+                  run_id = data.get("run_id", "unknown")
+                  ctx = extract(dict(request.headers))
+                  with tracer.start_as_current_span("agent-c.execute", context=ctx):
+                      start_time = time.time()
+                      
+                      # Simulate execution output
+                      output = {"result": "executed: " + data["plan"]}
+                      
+                      # Single push with both timestamps for clean provenance
+                      task_record = {
+                          "activity_id": "agent_c_run",
+                          "workflow_id": run_id,
+                          "custom_metadata": {"agent": "agent-c"},
+                          "used": {"plan": data["plan"]},
+                          "generated": output,
+                          "started_at": start_time,
+                          "ended_at": time.time(),
+                          "status": "FINISHED"
+                      }
+                      try:
+                          r_client.rpush("interception", json.dumps(task_record))
+                          print("LOG [Agent C]: Redis push successful!", flush=True)
+                      except Exception as e:
+                          print(f"LOG ERROR [Agent C]: Redis push failed: {e}", flush=True)
+                      
+                      return output
+              PY
+              python3 -u -m uvicorn app:app --host 0.0.0.0 --port 8000
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FLOWCEPT_SETTINGS_PATH
+              value: "/root/.flowcept/settings.yaml"
+            - name: GIT_PYTHON_REFRESH
+              value: "quiet"
+            - name: OTEL_SERVICE_NAME
+              value: agent-c
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.openlit-demo.svc.cluster.local:4318"
+            - name: OPENLIT_APPLICATION_NAME
+              value: multi-agent-demo
+            - name: OPENLIT_ENVIRONMENT
+              value: dev
+            - name: OPENLIT_PRICING_JSON
+              value: '{"tinyllama": {"prompt_token": 0.10, "completion_token": 0.10}}'
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "300m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-c
+  namespace: openlit-demo
+spec:
+  selector:
+    app: agent-c
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# =============================================================================
+# Arize Phoenix — LLM observability: trace visualization, embedding clusters,
+# RAG retrieval evaluation, hallucination detection, prompt playground.
+# Single container — no external dependencies.
+#
+# UI + OTLP HTTP receiver : port 6006
+# Port-forward: kubectl port-forward svc/phoenix -n openlit-demo 6006:6006
+# Open:         http://localhost:6006
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phoenix
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: phoenix
+  template:
+    metadata:
+      labels:
+        app: phoenix
+    spec:
+      containers:
+        - name: phoenix
+          image: arizephoenix/phoenix:latest
+          ports:
+            - name: ui-otlp
+              containerPort: 6006
+            - name: otlp-grpc
+              containerPort: 4317
+          env:
+            - name: PHOENIX_WORKING_DIR
+              value: /phoenix
+            - name: PHOENIX_ENABLE_AUTH
+              value: "false"
+            - name: PHOENIX_PORT
+              value: "6006"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phoenix
+  namespace: openlit-demo
+spec:
+  selector:
+    app: phoenix
+  ports:
+    - name: ui-otlp
+      port: 6006
+      targetPort: 6006
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+---
+# =============================================================================
+# Flowcept Redis — dedicated message broker for provenance stream
+# Using a separate Redis instance (port 6379 internally) to avoid
+# conflicts with Langfuse's Redis in the langfuse namespace.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowcept-redis
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowcept-redis
+  template:
+    metadata:
+      labels:
+        app: flowcept-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowcept-redis
+  namespace: openlit-demo
+spec:
+  selector:
+    app: flowcept-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+# =============================================================================
+# Flowcept MongoDB — W3C PROV-compliant provenance store
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowcept-mongodb
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowcept-mongodb
+  template:
+    metadata:
+      labels:
+        app: flowcept-mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:7.0
+          ports:
+            - containerPort: 27017
+          env:
+            - name: MONGO_INITDB_DATABASE
+              value: flowcept
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowcept-mongodb
+  namespace: openlit-demo
+spec:
+  selector:
+    app: flowcept-mongodb
+  ports:
+    - port: 27017
+      targetPort: 27017
+
+---
+# =============================================================================
+# Flowcept PROV-AGENT FastAPI script — mounted as /scripts/prov_api.py
+# Using a ConfigMap avoids heredoc YAML escaping issues.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowcept-prov-api
+  namespace: openlit-demo
+data:
+  consumer.py: |
+    import os
+    import json
+    import time
+    import redis
+    from pymongo import MongoClient
+
+    print("LOG [Consumer]: Initializing direct Redis-to-MongoDB pipeline...", flush=True)
+    r_client = redis.Redis(host="flowcept-redis", port=6379, decode_responses=True)
+    m_client = MongoClient(host="flowcept-mongodb", port=27017)
+    db = m_client["flowcept"]
+    collection = db["tasks"]
+
+    print("LOG [Consumer]: System ready. Monitoring queue 'interception'...", flush=True)
+
+    while True:
+        try:
+            packed_data = r_client.blpop("interception", timeout=2)
+            if packed_data:
+                queue_name, raw_json = packed_data
+                task_dict = json.loads(raw_json)
+                
+                # Normalize status for the Flowcept UI tracking chart match patterns
+                current_status = task_dict.get("status", "").upper()
+                if current_status in ["SUCCESS", "SUBMITTED"]:
+                    task_dict["status"] = "FINISHED"
+                elif current_status == "RUNNING":
+                    task_dict["status"] = "RUNNING"
+                
+                collection.insert_one(task_dict)
+        except Exception as e:
+            print(f"LOG ERROR [Consumer]: {e}", flush=True)
+            time.sleep(1)
+            
+  rest_api.py: |
+    import os
+    import time
+    import copy
+    from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+    from pymongo import MongoClient
+
+    app = FastAPI()
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    class UIQueryRequest(BaseModel):
+        question: str
+
+    def db():
+        c = MongoClient(os.getenv("MONGO_HOST","flowcept-mongodb"), int(os.getenv("MONGO_PORT","27017")))
+        return c["flowcept"]
+
+    @app.get("/")
+    def root(): return {"status": "ok"}
+
+    @app.get("/health/live")
+    def health(): return {"status": "ok"}
+
+    @app.get("/api/v1/api/v1")
+    @app.get("/api/v1")
+    def ui_base_probe():
+        return {"status": "ok", "message": "Flowcept REST API Router"}
+
+    def process_and_format_tasks(raw_tasks):
+        processed_tasks = []
+
+        # 0. Records are pre-filtered to ended_at-only by the REST query.
+        # No merging needed — each record is already a complete task instance.
+
+        # 1. Force strict chronological order by started_at.
+        # Canonical order is used as a tiebreaker for same-agent tasks where
+        # timestamps are identical or inverted due to push ordering.
+        CANONICAL_ORDER = [
+            "agent_a_run",
+            "call_llm", "call_agent_c",
+            "agent_c_run",
+        ]
+        def sort_key(t):
+            ts = t.get("started_at") or 0
+            act = t.get("activity_id", "")
+            order = CANONICAL_ORDER.index(act) if act in CANONICAL_ORDER else 99
+            return (ts, order)
+        sorted_tasks = sorted(raw_tasks, key=sort_key)
+        
+        resolved_ids = []
+
+        for i, raw_task in enumerate(sorted_tasks):
+            task = copy.deepcopy(raw_task)
+            activity = task.get("activity_id", f"task_{i}")
+            
+            task["activity_id"] = activity
+            task["task_id"] = task.get("task_id", activity)
+            task["variant_id"] = task.get("variant_id", activity)
+            if not task.get("workflow_id"):
+                task.pop("workflow_id", None)
+
+            # Extract Swimlane Agent Groups
+            metadata = task.get("custom_metadata", {})
+            agent_label = "agent-system"
+            if isinstance(metadata, dict):
+                agent_label = metadata.get("agent", "agent-system")
+            elif task.get("agent"):
+                agent_label = task.get("agent")
+            
+            task["agent_name"] = agent_label
+            task["agent_id"] = agent_label
+            task["agent"] = agent_label
+
+            # Causal lineage routing
+            parent_id = None
+            if i > 0:
+                if "call_agent_b" in activity:
+                    parent_id = "agent_a_initiation"
+                elif "call_llm" in activity:
+                    parent_id = "agent_a_initiation"
+                elif "call_agent_c" in activity:
+                    parent_id = "call_llm"
+                elif "execution_started" in activity:
+                    parent_id = "call_agent_c"
+                elif "execute_plan_completed" in activity:
+                    parent_id = "agent_c_execution_started"
+                
+                if not parent_id and resolved_ids:
+                    parent_id = resolved_ids[-1]
+
+            # Store clean resolution trace
+            resolved_ids.append(activity)
+
+            task["parent_task_id"] = parent_id
+            task["parent_id"] = parent_id
+            task["parent_task_ids"] = [parent_id] if parent_id else []
+            task["used"] = [parent_id] if parent_id else []
+            task["generated"] = [activity]
+
+            task["status"] = "FINISHED"
+
+            # Safe duration parsing
+            try:
+                started = float(task.get("started_at", 0)) if task.get("started_at") else 0
+                ended = float(task.get("ended_at", 0)) if task.get("ended_at") else 0
+            except (ValueError, TypeError):
+                started, ended = 0, 0
+                
+            if ended > started:
+                task["duration"] = round(ended - started, 2)
+            else:
+                task["duration"] = round(0.04 * (i + 1), 2)
+
+            processed_tasks.append(task)
+            
+        return processed_tasks
+
+    # ─── ROUTE IMPLEMENTATIONS ─────────────────────────────────────────────
+    @app.get("/tasks")
+    def tasks_fallback_list(limit: int = 50):
+        try:
+            docs = list(db()["tasks"].find({}, {"_id": 0}).sort("started_at", -1).limit(limit))
+            return process_and_format_tasks(docs)
+        except Exception:
+            return []
+
+    @app.delete("/api/v1/tasks/clear")
+    def tasks_clear():
+        try:
+            result = db()["tasks"].delete_many({})
+            return {"deleted": result.deleted_count}
+        except Exception as e:
+            return {"error": str(e)}, 500
+
+    @app.get("/api/v1/tasks")
+    @app.get("/api/v1/api/v1/tasks")
+    def tasks_primary_router(limit: int = 200):
+        try:
+            # Fetch only COMPLETED records (ended_at present) sorted ascending.
+            # Init-only records (no ended_at) are noise — they have no duration and
+            # are already covered by the completion record from the same task instance.
+            # 50 records = ~8 full runs of 6 tasks each, plenty for the run selector.
+            docs = list(db()["tasks"].find(
+                {"ended_at": {"$exists": True, "$ne": None}},
+                {"_id": 0}
+            ).sort("started_at", 1).limit(limit))
+            formatted = process_and_format_tasks(docs)
+            completed_count = sum(1 for t in formatted if t["status"] == "FINISHED")
+            error_count = sum(1 for t in formatted if t["status"] == "ERROR")
+            
+            return {
+                "tasks": formatted,
+                "total": len(formatted),
+                "completed": completed_count,
+                "errors": error_count
+            }
+        except Exception as e:
+            print(f"Error packing endpoint metrics: {e}")
+            return {"tasks": [], "total": 0, "completed": 0, "errors": 0}
+
+    @app.get("/api/v1/workflows")
+    @app.get("/api/v1/api/v1/workflows")
+    def workflows():
+        return {"workflows": [{"workflow_id": "workflow_alpha", "name": "Agentic Multi-Agent Lineage Tree"}], "total": 1}
+
+    @app.get("/api/v1/objects")
+    @app.get("/api/v1/api/v1/objects")
+    def objects(limit: int = 50):
+        try: objs = list(db()["objects"].find({}, {"_id": 0}).limit(limit))
+        except Exception: objs = []
+        return {"objects": objs, "total": len(objs)}
+
+    @app.get("/api/v1/tasks/{task_id}")
+    @app.get("/api/v1/api/v1/tasks/{task_id}")
+    def get_task(task_id: str):
+        doc = db()["tasks"].find_one({"task_id": task_id}, {"_id": 0})
+        if doc:
+            formatted = process_and_format_tasks([doc])
+            return formatted[0]
+        return {"error": "not found"}
+
+    # --- NATURAL LANGUAGE QUERY ROUTER ---
+    @app.post("/query")
+    @app.post("/api/v1/query")
+    @app.post("/api/v1/api/v1/query")
+    async def query_handler(request: Request):
+        try: body = await request.json()
+        except Exception: return {"status": "error", "response": "Invalid JSON payload."}
+
+        question = body.get("question", "").lower()
+        d = db()
+        try:
+            if any(w in question for w in ["fail", "error"]):
+                docs = list(d["tasks"].find({"status":"ERROR"},{"_id":0}).limit(20))
+                if not docs:
+                    docs = list(d["tasks"].find({"exception":{"$exists":True}},{"_id":0}).limit(20))
+                if docs:
+                    summaries = [{"activity": t.get("activity_id","?"), "agent": t.get("custom_metadata",{}).get("agent","?") if isinstance(t.get("custom_metadata"),dict) else "?", "exception": t.get("exception","n/a"), "used": t.get("used",{})} for t in docs]
+                    msg = f"Found {len(docs)} failed tasks: {summaries}"
+                else:
+                    msg = "Found 0 failed tasks."
+                return {"status": "success", "response": msg, "answer": msg, "tasks": docs}
+            elif any(w in question for w in ["longest", "slowest", "duration", "average"]):
+                pipeline = [
+                    {"$match": {"started_at":{"$exists":True},"ended_at":{"$exists":True}}},
+                    {"$project": {
+                        "agent": {"$ifNull": ["$custom_metadata.agent", "$agent"]},
+                        "duration": {"$subtract": ["$ended_at", "$started_at"]}
+                    }},
+                    {"$group": {"_id": "$agent", "avg_s": {"$avg": "$duration"}, "max_s": {"$max": "$duration"}, "count": {"$sum":1}}},
+                    {"$sort": {"avg_s":-1}}
+                ]
+                res = list(d["tasks"].aggregate(pipeline))
+                for r in res:
+                    r["avg_s"] = round(r.get("avg_s", 0), 3)
+                    r["max_s"] = round(r.get("max_s", 0), 3)
+                msg = f"Telemetry verified. Averages per agent lane profile: {res}"
+                return {"status": "success", "response": msg, "answer": msg, "data": res}
+            elif any(w in question for w in ["input", "used", "receive", "prompt", "llm input"]):
+                activity = "call_llm"
+                if "call_agent" in question:
+                    activity = "call_agent_c"
+                docs = list(d["tasks"].find({"activity_id": activity},{"_id":0}).sort("started_at",-1).limit(5))
+                if docs:
+                    summaries = []
+                    for t in docs:
+                        summaries.append({"activity": t.get("activity_id"), "agent": t.get("custom_metadata",{}).get("agent","?") if isinstance(t.get("custom_metadata"),dict) else "?", "used": t.get("used",{}), "duration_s": round((t.get("ended_at",0) or 0)-(t.get("started_at",0) or 0),2)})
+                    msg = f"Last {len(docs)} '{activity}' tasks received these inputs: {summaries}"
+                else:
+                    msg = f"No tasks found with activity_id='{activity}'."
+                return {"status": "success", "response": msg, "answer": msg}
+            elif any(w in question for w in ["last run", "latest run", "recent run", "last workflow", "how many tasks"]):
+                all_tasks = list(d["tasks"].find({"started_at":{"$exists":True}},{"_id":0}).sort("started_at",-1).limit(200))
+                if not all_tasks:
+                    return {"status": "success", "response": "No tasks found.", "answer": "No tasks found."}
+                # Group by workflow_id first (reliable for both base demo and LangGraph).
+                # Fall back to timestamp proximity only for tasks without workflow_id.
+                latest_wf = all_tasks[0].get("workflow_id")
+                if latest_wf:
+                    run_tasks = [t for t in all_tasks if t.get("workflow_id") == latest_wf]
+                else:
+                    latest_start = all_tasks[0].get("started_at", 0)
+                    # Use a wide window — LangGraph runs can span several minutes
+                    run_tasks = [t for t in all_tasks if abs(t.get("started_at",0) - latest_start) < 600]
+                agents = {}
+                activities = []
+                for t in run_tasks:
+                    ag = t.get("custom_metadata",{}).get("agent","?") if isinstance(t.get("custom_metadata"),dict) else t.get("agent","?")
+                    agents[ag] = agents.get(ag, 0) + 1
+                    act = t.get("activity_id","?")
+                    if act not in activities:
+                        activities.append(act)
+                framework = all_tasks[0].get("custom_metadata",{}).get("framework","") if isinstance(all_tasks[0].get("custom_metadata"),dict) else ""
+                wf_label = f" (workflow_id: {latest_wf})" if latest_wf else ""
+                msg = (f"Last run{wf_label} had {len(run_tasks)} tasks across agents: {agents}. "
+                       f"Activities executed: {activities}."
+                       + (f" Framework: {framework}." if framework else ""))
+                return {"status": "success", "response": msg, "answer": msg}
+            elif any(w in question for w in ["count", "total", "how many", "number of"]):
+                total = d["tasks"].count_documents({})
+                by_agent_pipeline = [
+                    {"$project": {"agent": {"$ifNull": ["$custom_metadata.agent","$agent","unknown"]}}},
+                    {"$group": {"_id": "$agent", "count": {"$sum": 1}}}
+                ]
+                by_agent = {r["_id"]: r["count"] for r in d["tasks"].aggregate(by_agent_pipeline)}
+                msg = f"Total tasks in MongoDB: {total}. By agent: {by_agent}"
+                return {"status": "success", "response": msg, "answer": msg}
+            else:
+                total = d["tasks"].count_documents({})
+                msg = f"Total tasks: {total}. Try: 'which agent took longest', 'what inputs did call_llm receive', 'show failed tasks', 'how many tasks ran in the last run'."
+                return {"status": "success", "response": msg, "answer": msg}
+        except Exception as e:
+            return {"status": "error", "response": f"Internal query computation failure: {str(e)}"}
+  start.sh: |
+    #!/bin/sh
+    echo "LOG: Bootstrapping Flowcept Unified Pipeline..."
+    pip install --no-cache-dir redis pymongo fastapi uvicorn
+    
+    # Create a dedicated app directory to avoid root scope issues
+    mkdir -p /app
+    cp /scripts/consumer.py /app/consumer.py
+    cp /scripts/rest_api.py /app/rest_api.py
+    
+    # Start the background consumer process
+    python3 -u /app/consumer.py > /var/log/consumer.log 2>&1 &
+    
+    echo "LOG: Starting Unified REST & Query Engine on port 8000..."
+    exec uvicorn rest_api:app --app-dir /app --host 0.0.0.0 --port 8000
+---
+# =============================================================================
+# Flowcept Consumer — reads Redis interception channel, writes to MongoDB
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowcept-consumer
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowcept-consumer
+  template:
+    metadata:
+      labels:
+        app: flowcept-consumer
+    spec:
+      containers:
+        - name: flowcept-consumer
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir py-cpuinfo pymongo redis pandas numpy && pip install --no-cache-dir "flowcept[mongo]" &&
+              cp /scripts/consumer.py /consumer.py && python3 /consumer.py
+          env:
+            # FIX: Force the consumer to see the exact same settings path as the agents
+            - name: FLOWCEPT_SETTINGS_PATH
+              value: "/root/.flowcept/settings.yaml"
+            - name: MQ_ENABLED
+              value: "true"
+            - name: MQ_TYPE
+              value: "redis"
+            - name: MQ_HOST
+              value: "flowcept-redis"
+            - name: MQ_PORT
+              value: "6379"
+            - name: MONGO_ENABLED
+              value: "true"
+            - name: MONGO_HOST
+              value: "flowcept-mongodb"
+            - name: MONGO_PORT
+              value: "27017"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+            - name: prov-api-script
+              mountPath: /scripts
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+        - name: prov-api-script
+          configMap:
+            name: flowcept-prov-api
+
+---
+# =============================================================================
+# Flowcept PROV-AGENT — natural-language provenance query server (port 8095)
+#
+# Port-forward: kubectl port-forward svc/flowcept-agent -n openlit-demo 8010:8000
+# Query: curl -s -X POST http://localhost:5000/query \
+#              -H "Content-Type: application/json" \
+#              -d '{"question": "which agent took longest?"}'
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowcept-agent
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowcept-agent
+  template:
+    metadata:
+      labels:
+        app: flowcept-agent
+    spec:
+      containers:
+        - name: flowcept-agent
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn py-cpuinfo pymongo redis gitpython && pip install --no-cache-dir "flowcept[mongo,llm_agent]" &&
+              cp /scripts/start.sh /start.sh && chmod +x /start.sh &&
+              /start.sh
+          ports:
+            - name: unified-api
+              containerPort: 8000
+          env:
+            # Fixes the ValueError by forcing Flowcept out of offline caching mode
+            - name: FLOWCEPT_DB_FLUSH_MODE
+              value: "online"
+            # Ensures core instrumentation engine attaches cleanly to the services
+            - name: FLOWCEPT_SETTINGS_PATH
+              value: "/root/.flowcept/settings.yaml"
+            - name: MQ_ENABLED
+              value: "true"
+            - name: MQ_TYPE
+              value: "redis"
+            - name: MQ_HOST
+              value: "flowcept-redis"
+            - name: MQ_PORT
+              value: "6379"
+            - name: MONGO_ENABLED
+              value: "true"
+            - name: MONGO_HOST
+              value: "flowcept-mongodb"
+            - name: MONGO_PORT
+              value: "27017"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+            - name: prov-api-script
+              mountPath: /scripts
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+        - name: prov-api-script
+          configMap:
+            name: flowcept-prov-api
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowcept-agent
+  namespace: openlit-demo
+spec:
+  selector:
+    app: flowcept-agent
+  ports:
+    - name: unified-api
+      port: 8000
+      targetPort: 8000
+
+---
+# =============================================================================
+# Flowcept REST API — read-only structured query API with Swagger UI
+#
+# Endpoints: /api/v1/tasks  /api/v1/workflows  /api/v1/objects
+# Swagger UI: http://localhost:5000/docs  (after port-forward)
+# Port-forward: kubectl port-forward svc/flowcept-rest -n openlit-demo 5000:5000
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowcept-rest
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowcept-rest
+  template:
+    metadata:
+      labels:
+        app: flowcept-rest
+    spec:
+      containers:
+        - name: flowcept-rest
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn pymongo &&
+              cp /scripts/rest_api.py /rest_api.py &&
+              uvicorn rest_api:app --host 0.0.0.0 --port 5000
+          ports:
+            - name: rest-api
+              containerPort: 5000
+          env:
+            - name: MONGO_ENABLED
+              value: "true"
+            - name: MONGO_HOST
+              value: "flowcept-mongodb"
+            - name: MONGO_PORT
+              value: "27017"
+            - name: MQ_ENABLED
+              value: "true"
+            - name: MQ_TYPE
+              value: "redis"
+            - name: MQ_HOST
+              value: "flowcept-redis"
+            - name: MQ_PORT
+              value: "6379"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+          volumeMounts:
+            - name: flowcept-cfg
+              mountPath: /root/.flowcept
+            - name: prov-api-script
+              mountPath: /scripts
+      volumes:
+        - name: flowcept-cfg
+          configMap:
+            name: flowcept-settings
+        - name: prov-api-script
+          configMap:
+            name: flowcept-prov-api
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowcept-rest
+  namespace: openlit-demo
+spec:
+  selector:
+    app: flowcept-rest
+  ports:
+    - name: rest-api
+      port: 5000
+      targetPort: 5000
+
+---
+# =============================================================================
+# Flowcept UI — Provenance Dashboard (serves the React-based UI on port 8020)
+#
+# Self-contained HTML dashboard that connects to flowcept-agent:8095 (PROV-AGENT)
+# and flowcept-rest:5000 (REST API) from inside the cluster, or via port-forwards
+# when accessed from the host browser.
+#
+# Port-forward: kubectl port-forward svc/flowcept-ui -n openlit-demo 8020:8020
+# Open: http://localhost:8020
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowcept-ui-html
+  namespace: openlit-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flowcept Provenance Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.11.0/dist/tabler-icons.min.css">
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      :root{--bg:#ffffff;--bg2:#f8f9fa;--bg3:#f1f3f5;--text:#1a1a2e;--text2:#6c757d;--text3:#adb5bd;
+        --border:#dee2e6;--blue:#378add;--green:#1D9E75;--amber:#EF9F27;--red:#E24B4A;--purple:#534AB7;
+        --font:'Inter',-apple-system,sans-serif;--mono:'JetBrains Mono','Fira Code',monospace;--radius:8px}
+      @media(prefers-color-scheme:dark){:root{--bg:#16161e;--bg2:#1e1e2e;--bg3:#252535;--text:#cdd6f4;
+        --text2:#9399b2;--text3:#6c7086;--border:#313244}}
+      body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14px;height:100vh;display:flex;flex-direction:column}
+      .topbar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--bg);flex-shrink:0}
+      .logo{font-size:15px;font-weight:600;display:flex;align-items:center;gap:6px}
+      .logo-icon{width:24px;height:24px;background:var(--purple);border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px}
+      .badge{font-size:11px;padding:2px 8px;border-radius:99px;font-weight:500}
+      .badge-live{background:#d4edda;color:#155724}.badge-err{background:#f8d7da;color:#721c24}.badge-idle{background:var(--bg3);color:var(--text2)}
+      @media(prefers-color-scheme:dark){.badge-live{background:#1e3a2b;color:#75d9a0}.badge-err{background:#3a1e1e;color:#f98c8c}.badge-idle{background:var(--bg3);color:var(--text2)}}
+      .top-inputs{display:flex;gap:6px;margin-left:auto;align-items:center}
+      .top-inputs input{font-size:12px;padding:5px 9px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);color:var(--text);width:220px}
+      .top-inputs input:focus{outline:none;border-color:var(--blue)}
+      .btn{font-size:12px;padding:5px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);color:var(--text);cursor:pointer;display:flex;align-items:center;gap:4px}
+      .btn:hover{background:var(--bg3)}.btn-primary{background:var(--blue);color:#fff;border-color:var(--blue)}.btn-primary:hover{opacity:.9}
+      .main{display:grid;grid-template-columns:1fr 340px;flex:1;overflow:hidden}
+      .left{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
+      .tabs{display:flex;border-bottom:1px solid var(--border);flex-shrink:0}
+      .tab{padding:9px 16px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;color:var(--text2);white-space:nowrap}
+      .tab.active{color:var(--text);border-bottom-color:var(--blue);font-weight:500}
+      .tab-actions{margin-left:auto;display:flex;align-items:center;padding-right:8px;gap:6px}
+      .panel{flex:1;overflow-y:auto;padding:14px 16px}
+      .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
+      .metric{background:var(--bg2);border-radius:var(--radius);padding:10px 12px;border:1px solid var(--border)}
+      .metric-lbl{font-size:11px;color:var(--text2);margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
+      .metric-val{font-size:22px;font-weight:600}
+      .val-ok{color:var(--green)}.val-err{color:var(--red)}.val-warn{color:var(--amber)}
+      .sec{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text2);margin-bottom:8px}
+      .task-list{display:flex;flex-direction:column;gap:3px}
+      .task-row{display:grid;grid-template-columns:12px 1fr auto 56px;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--radius);font-size:12px;cursor:pointer;border:1px solid transparent}
+      .task-row:hover{background:var(--bg2)}.task-row.sel{background:var(--bg2);border-color:var(--border)}
+      .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+      .dot-ok{background:var(--green)}.dot-err{background:var(--red)}.dot-run{background:var(--amber)}
+      .task-info{overflow:hidden}.task-name{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .task-sub{font-size:11px;color:var(--text2)}
+      .dur{font-size:11px;color:var(--text2);text-align:right;white-space:nowrap}
+      .bar-bg{height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;margin-top:2px}
+      .bar-fill{height:100%;border-radius:2px}
+      .bar-ok{background:var(--green)}.bar-err{background:var(--red)}.bar-run{background:var(--amber)}
+      .prov-area{padding:12px}
+      .right{display:flex;flex-direction:column;overflow:hidden}
+      .detail{flex:0 0 auto;padding:12px 14px;border-bottom:1px solid var(--border);max-height:220px;overflow-y:auto}
+      .detail h3{font-size:13px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+      .kv-grid{display:grid;grid-template-columns:85px 1fr;gap:2px 8px;font-size:12px}
+      .kv-k{color:var(--text2);padding:2px 0}.kv-v{padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:11px}
+      .kv-tag{font-family:var(--font);background:var(--bg3);border-radius:4px;padding:1px 6px;font-size:11px}
+      .chat-section{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+      .chat-header{padding:9px 14px;font-size:12px;font-weight:600;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;flex-shrink:0}
+      .quick{display:flex;flex-wrap:wrap;gap:4px;padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0}
+      .qbtn{font-size:11px;padding:3px 9px;border-radius:99px;border:1px solid var(--border);background:var(--bg2);color:var(--text2);cursor:pointer;white-space:nowrap}
+      .qbtn:hover{background:var(--bg3);color:var(--text)}
+      .msgs{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-height:0}
+      .msg{max-width:88%;padding:8px 11px;border-radius:var(--radius);font-size:12px;line-height:1.55}
+      .msg-user{align-self:flex-end;background:var(--blue);color:#fff}
+      .msg-agent{align-self:flex-start;background:var(--bg2);border:1px solid var(--border)}
+      .msg-loading{opacity:.6;font-style:italic}
+      .input-row{display:flex;gap:6px;padding:8px 12px;border-top:1px solid var(--border);flex-shrink:0}
+      .input-row input{flex:1;font-size:12px;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg2);color:var(--text)}
+      .input-row input:focus{outline:none;border-color:var(--blue)}
+      .empty{text-align:center;padding:48px 16px;color:var(--text3)}
+      .empty i{font-size:32px;display:block;margin-bottom:10px}
+      svg text{font-family:var(--font)}
+      pre{font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-all}
+      .wf-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:8px 10px;border-radius:var(--radius);font-size:12px;cursor:pointer;border:1px solid transparent}
+      .wf-row:hover{background:var(--bg2)}
+    </style>
+    </head>
+    <body>
+    <div class="topbar">
+      <div class="logo"><div class="logo-icon"><i class="ti ti-share-3" aria-hidden="true"></i></div>Flowcept Provenance</div>
+      <span class="badge badge-idle" id="badge">● idle</span>
+      <div class="top-inputs">
+        <input id="rest-url" value="http://localhost:5000/api/v1" placeholder="REST API"/>
+        <input id="agent-url" value="http://localhost:5000" placeholder="PROV-AGENT" style="width:180px"/>
+        <button class="btn btn-primary" onclick="connect()"><i class="ti ti-plug" aria-hidden="true"></i> Connect</button>
+      </div>
+    </div>
+    <div class="main">
+      <div class="left">
+        <div class="tabs">
+          <div class="tab active" onclick="switchTab('tasks',this)">Tasks</div>
+          <div class="tab" onclick="switchTab('graph',this)">Prov graph</div>
+          <div class="tab" onclick="switchTab('workflows',this)">Workflows</div>
+          <div class="tab-actions">
+            <button class="btn" onclick="refresh()" title="Refresh"><i class="ti ti-refresh" aria-hidden="true"></i></button>
+            <button class="btn" onclick="clearDB()" title="Clear all tasks from MongoDB" style="opacity:0.6"><i class="ti ti-trash" aria-hidden="true"></i></button>
+          </div>
+        </div>
+        <div class="panel" id="panel-tasks">
+          <div class="metrics">
+            <div class="metric"><div class="metric-lbl">Total tasks</div><div class="metric-val" id="m-total">—</div></div>
+            <div class="metric"><div class="metric-lbl">Completed</div><div class="metric-val val-ok" id="m-ok">—</div></div>
+            <div class="metric"><div class="metric-lbl">Errors</div><div class="metric-val val-err" id="m-err">—</div></div>
+            <div class="metric"><div class="metric-lbl">Avg duration</div><div class="metric-val" id="m-avg">—</div></div>
+          </div>
+          <div class="sec">Recent tasks</div>
+          <div class="task-list" id="task-list"><div class="empty"><i class="ti ti-database-off"></i>Connect to load tasks</div></div>
+        </div>
+        <div class="panel" id="panel-graph" style="display:none">
+          <div class="sec" style="margin-bottom:12px">W3C PROV lineage graph</div>
+          <div class="prov-area" style="overflow:auto;max-height:calc(100vh - 140px)"><svg id="prov-svg" width="100%" xmlns="http://www.w3.org/2000/svg">
+            <text x="300" y="140" text-anchor="middle" font-size="13" fill="#adb5bd">Connect and load tasks to render graph</text>
+          </svg></div>
+        </div>
+        <div class="panel" id="panel-workflows" style="display:none">
+          <div class="sec">Workflows</div>
+          <div id="wf-list"><div class="empty"><i class="ti ti-sitemap"></i>No workflows loaded</div></div>
+        </div>
+      </div>
+      <div class="right">
+        <div class="detail">
+          <h3><i class="ti ti-info-circle" aria-hidden="true"></i>Task detail</h3>
+          <div id="detail-body" style="color:var(--text3);font-size:12px">Select a task to inspect</div>
+        </div>
+        <div class="chat-section">
+          <div class="chat-header"><i class="ti ti-robot" aria-hidden="true"></i>PROV-AGENT</div>
+          <div class="quick">
+            <button class="qbtn" onclick="q('which agent took longest on average?')">slowest agent?</button>
+            <button class="qbtn" onclick="q('how many tasks ran?')">task count?</button>
+            <button class="qbtn" onclick="q('show failed tasks and their inputs')">failures?</button>
+            <button class="qbtn" onclick="q('what inputs did call_llm receive?')">llm inputs?</button>
+            <button class="qbtn" onclick="q('generate_workflow_provenance_card')">prov card</button>
+          </div>
+          <div class="msgs" id="msgs">
+            <div class="msg msg-agent">Connect the PROV-AGENT above, then ask anything about your workflow provenance.</div>
+          </div>
+          <div class="input-row">
+            <input id="qin" placeholder="Ask about tasks, agents, inputs, outputs..." onkeydown="if(event.key==='Enter')sendQ()"/>
+            <button class="btn btn-primary" onclick="sendQ()"><i class="ti ti-send" aria-hidden="true"></i></button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+    let restBase='http://localhost:5000/api/v1',agentBase='http://localhost:5000';
+    let tasks=[],selId=null,activeTab='tasks';
+    function setBadge(txt,cls){const b=document.getElementById('badge');b.textContent=txt;b.className='badge '+cls}
+    function switchTab(n,el){
+      activeTab=n;
+      document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+      el.classList.add('active');
+      ['tasks','graph','workflows'].forEach(t=>{
+        const p=document.getElementById('panel-'+t);
+        if(p)p.style.display=t===n?'':'none';
+      });
+      if(n==='graph')drawGraph();
+      if(n==='workflows')loadWf();
+    }
+    async function connect(){
+      restBase=document.getElementById('rest-url').value.replace(/\/$/,'');
+      agentBase=document.getElementById('agent-url').value.replace(/\/$/,'');
+      setBadge('● connecting','badge-idle');
+      try{
+        const r=await fetch(restBase+'/api/v1');
+        if(r.ok){setBadge('● connected','badge-live');await refresh();}
+        else throw new Error();
+      }catch(e){setBadge('● demo mode','badge-err');loadDemo();}
+    }
+    function loadDemo(){
+      const now=Date.now()/1000;
+      tasks=[
+        {task_id:'t-001',activity_name:'call_agent_b',agent:'agent-a',workflow_name:'multi-agent-demo',started_at:now-13,ended_at:now-10.2,status:'finished',used:{task:'hello from agent-a'},generated:{forwarded:true}},
+        {task_id:'t-002',activity_name:'call_llm',agent:'agent-b',workflow_name:'multi-agent-demo',started_at:now-10.1,ended_at:now-7.8,status:'finished',used:{task:'hello from agent-a'},generated:{response:'tinyllama response text...'}},
+        {task_id:'t-003',activity_name:'call_agent_c',agent:'agent-b',workflow_name:'multi-agent-demo',started_at:now-7.7,ended_at:now-7.5,status:'finished',used:{plan:'tinyllama response text...'},generated:{forwarded:true}},
+        {task_id:'t-004',activity_name:'execute_plan',agent:'agent-c',workflow_name:'multi-agent-demo',started_at:now-7.4,ended_at:now-7.3,status:'finished',used:{plan:'tinyllama response text...'},generated:{result:'executed: tinyllama response text...'}},
+        {task_id:'t-005',activity_name:'call_llm',agent:'agent-b',workflow_name:'multi-agent-demo',started_at:now-55,ended_at:now-53.2,status:'error',used:{task:'explain DNS'},exception:'ConnectionError: ollama timeout'},
+      ];
+      renderTasks();updateMetrics();
+    }
+    async function clearDB(){
+      if(!confirm('Delete ALL tasks from MongoDB? This cannot be undone.'))return;
+      try{
+        const r=await fetch(restBase+'/api/v1/tasks/clear',{method:'DELETE'});
+        if(r.ok){ tasks=[]; _selectedRunIdx=-1; renderTasks();updateMetrics();drawGraph(); }
+        else alert('Clear failed: '+r.status);
+      }catch(e){alert('Clear failed: '+e);}
+    }
+    async function refresh(){
+      try{
+        const r=await fetch(restBase+'/api/v1/tasks?limit=200');
+        if(!r.ok)throw new Error();
+        const d=await r.json();
+        tasks=d.tasks||d||[];
+        _selectedRunIdx=-1;  // always jump to most recent run on refresh
+        renderTasks();updateMetrics();
+        if(activeTab==='graph')drawGraph();
+        if(activeTab==='workflows')loadWf();
+      }catch(e){loadDemo();}
+    }
+    function dur(t){if(!t.ended_at||!t.started_at)return null;return(t.ended_at-t.started_at)*1000;}
+    function fmtD(ms){if(ms===null||ms===undefined)return'—';if(ms<1000)return Math.round(ms)+'ms';return(ms/1000).toFixed(2)+'s';}
+    function maxDur(){return Math.max(...tasks.map(t=>dur(t)||0),1);}
+    function updateMetrics(){
+      const tot=tasks.length,errs=tasks.filter(t=>t.status==='error'||t.exception).length;
+      const ok=tasks.filter(t=>(t.status||'').toUpperCase()==='FINISHED'||(t.status||'').toUpperCase()==='COMPLETED'||(t.status||'').toUpperCase()==='SUCCESS').length;
+      const ds=tasks.map(t=>dur(t)).filter(d=>d!==null);
+      const avg=ds.length?ds.reduce((a,b)=>a+b,0)/ds.length:null;
+      document.getElementById('m-total').textContent=tot;
+      document.getElementById('m-ok').textContent=ok;
+      document.getElementById('m-err').textContent=errs;
+      document.getElementById('m-avg').textContent=fmtD(avg);
+    }
+    function renderTasks(){
+      const el=document.getElementById('task-list');
+      if(!tasks.length){el.innerHTML='<div class="empty"><i class="ti ti-database-off"></i>No tasks found</div>';return;}
+      const mx=maxDur();
+      el.innerHTML=tasks.slice(0,40).map(t=>{
+        const d=dur(t);const isErr=t.status==='error'||t.exception;const isRun=t.status==='running';
+        const dc=isErr?'dot-err':isRun?'dot-run':'dot-ok';const bc=isErr?'bar-err':isRun?'bar-run':'bar-ok';
+        const pct=d?Math.max(3,(d/mx)*100):3;
+        const sub=t.agent||t.workflow_name||'';
+        return`<div class="task-row${selId===t.task_id?' sel':''}" onclick="selTask('${t.task_id}')">
+          <div class="dot ${dc}"></div>
+          <div class="task-info"><div class="task-name">${t.activity_name||t.task_id}</div><div class="task-sub">${sub}</div></div>
+          <div class="dur">${fmtD(d)}</div>
+          <div><div class="bar-bg"><div class="bar-fill ${bc}" style="width:${pct.toFixed(1)}%"></div></div></div>
+        </div>`;
+      }).join('');
+    }
+    function selTask(id){
+      selId=id;renderTasks();
+      const t=tasks.find(x=>x.task_id===id);if(!t)return;
+      const el=document.getElementById('detail-body');
+      const d=dur(t);
+      const rows=[['ID',t.task_id],['Function',t.activity_name||'—'],['Agent',t.agent||'—'],
+        ['Status',t.status||(t.exception?'error':'finished')],['Duration',fmtD(d)],
+        ['Workflow',t.workflow_name||'—'],
+        ['Input',t.used?JSON.stringify(t.used).slice(0,80):'—'],
+        ['Output',t.generated?JSON.stringify(t.generated).slice(0,80):(t.exception?'⚠ '+String(t.exception).slice(0,70):'—')]
+      ];
+      el.innerHTML='<div class="kv-grid">'+rows.map(([k,v])=>`<div class="kv-k">${k}</div><div class="kv-v" title="${String(v).replace(/"/g,'')}">${v}</div>`).join('')+'</div>';
+    }
+    // Add a run selector UI above the graph
+    function buildRunSelector(runs, selectedIdx, onSelect){
+      const existing=document.getElementById('run-selector');
+      if(existing)existing.remove();
+      if(runs.length<1)return;
+      const div=document.createElement('div');
+      div.id='run-selector';
+      div.style='display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:wrap;';
+      div.innerHTML='<span style="font-size:11px;color:var(--text2);white-space:nowrap">Run:</span>';
+      // Show last 5 runs only (most recent first)
+      const displayRuns=runs.slice(-5).reverse();
+      const offset=Math.max(0, runs.length-5);
+      displayRuns.forEach((r,di)=>{
+        const i=runs.length-1-(di);  // real index in runs array
+        const btn=document.createElement('button');
+        btn.className='btn'+(i===selectedIdx?' btn-primary':'');
+        btn.style='font-size:10px;padding:2px 8px;';
+        const t=r[0];
+        const ts=t.started_at?new Date(t.started_at*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}):'run '+(i+1);
+        btn.textContent=ts;
+        btn.onclick=()=>onSelect(i);
+        div.appendChild(btn);
+      });
+      const provArea=document.querySelector('#panel-graph .prov-area');
+      provArea.parentNode.insertBefore(div,provArea);
+    }
+
+    let _graphRuns=[], _selectedRunIdx=0;    
+
+    function drawGraph(){
+      const svg=document.getElementById('prov-svg');
+      if(!tasks.length)return;
+
+      // ── Config ────────────────────────────────────────────────────
+      const COLS={'agent-a':'#378ADD','agent-b':'#1D9E75','agent-c':'#BA7517'};
+      const DEFAULT_COL='#7C6AF7';
+      const NODE_W=160, NODE_H=44, NODE_GAP=18;
+      const COL_W=180, COL_PAD=16, HEADER_H=44, TOP_PAD=16;
+      const CROSS_ARROW_COL='#E24B4A';
+
+      // No client-side dedup needed: server returns only completed records,
+      // one per task instance, already merged and sorted.
+      const deduped=[...tasks];
+
+      // ── Group into workflow runs ───────────────────────────────────
+      const sorted=[...deduped].sort((a,b)=>(a.started_at||0)-(b.started_at||0));
+      let runs=[];
+
+      // Strategy 1: group ONLY tasks with a real workflow_id.
+      const withId=sorted.filter(t=>t.bundle_exec_id||t.workflow_id);
+      const withoutId=sorted.filter(t=>!t.bundle_exec_id&&!t.workflow_id);
+      if(withId.length){
+        const map={};
+        withId.forEach(t=>{
+          const key=t.bundle_exec_id||t.workflow_id;
+          if(!map[key])map[key]=[];
+          map[key].push(t);
+        });
+        runs=[...Object.values(map)];
+      }
+      if(withoutId.length){
+        // Strategy 2: fixed-size batches for tasks without workflow_id
+        const KNOWN_RUN_SIZE=4;
+        for(let i=0;i<withoutId.length;i+=KNOWN_RUN_SIZE)
+          runs.push(withoutId.slice(i,i+KNOWN_RUN_SIZE));
+      }
+      runs.sort((a,b)=>(a[0].started_at||0)-(b[0].started_at||0));
+
+      _graphRuns=runs;
+      // Default to most recent run
+      if(_selectedRunIdx>=runs.length||_selectedRunIdx<0)_selectedRunIdx=runs.length-1;
+      buildRunSelector(runs, _selectedRunIdx, (idx)=>{ _selectedRunIdx=idx; drawGraph(); });
+
+      const latestRun=runs[_selectedRunIdx]||[];
+
+      // ── Layout ────────────────────────────────────────────────────
+      const agents=[...new Set(latestRun.map(t=>t.agent||'unknown'))];
+      // Ensure consistent column order
+      const agentOrder=['agent-a','agent-b','agent-c'];
+      const orderedAgents=[...agentOrder.filter(a=>agents.includes(a)),...agents.filter(a=>!agentOrder.includes(a))];
+
+      const agentTasks={};
+      orderedAgents.forEach(a=>{agentTasks[a]=latestRun.filter(t=>(t.agent||'unknown')===a).sort((x,y)=>(x.started_at||0)-(y.started_at||0));});
+
+      const maxRows=Math.max(...orderedAgents.map(a=>agentTasks[a].length),1);
+      const W=Math.max(600, orderedAgents.length*COL_W+COL_PAD*2);
+      const H=HEADER_H+TOP_PAD+maxRows*(NODE_H+NODE_GAP)+NODE_GAP+40;
+
+      svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+      svg.setAttribute('height',H);
+
+      const pos={};
+      let s=`<defs>
+        <marker id="arr" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M1 1L11 6L1 11" fill="none" stroke="#6B7280" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+        <marker id="arr-cross" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M1 1L11 6L1 11" fill="none" stroke="${CROSS_ARROW_COL}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+        <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+          <feDropShadow dx="0" dy="1" stdDeviation="2" flood-opacity="0.12"/>
+        </filter>
+      </defs>`;
+
+      // ── Draw column backgrounds + headers ─────────────────────────
+      orderedAgents.forEach((ag,ai)=>{
+        const c=COLS[ag]||DEFAULT_COL;
+        const cx=COL_PAD+ai*COL_W+COL_W/2;
+        const colX=COL_PAD+ai*COL_W;
+        s+=`<rect x="${colX+4}" y="4" width="${COL_W-8}" height="${H-8}" rx="12"
+               fill="${c}0D" stroke="${c}40" stroke-width="1.5"/>`;
+        // Header badge
+        s+=`<rect x="${cx-52}" y="${TOP_PAD}" width="104" height="28" rx="14"
+               fill="${c}" filter="url(#shadow)"/>`;
+        s+=`<text x="${cx}" y="${TOP_PAD+18}" text-anchor="middle" font-size="12"
+               font-weight="700" fill="#ffffff" letter-spacing="0.3">${ag}</text>`;
+      });
+
+      // ── Draw nodes ─────────────────────────────────────────────────
+      orderedAgents.forEach((ag,ai)=>{
+        const c=COLS[ag]||DEFAULT_COL;
+        const cx=COL_PAD+ai*COL_W+COL_W/2;
+        agentTasks[ag].forEach((t,ti)=>{
+          const ty=HEADER_H+TOP_PAD+ti*(NODE_H+NODE_GAP)+NODE_H/2;
+          const nx=cx-NODE_W/2, ny=ty-NODE_H/2;
+          const isErr=t.status==='error'||!!t.exception;
+          const fc=isErr?'#FEE2E2':'#ffffff';
+          const sc=isErr?'#E24B4A':c;
+          const tc=isErr?'#991B1B':c;
+          pos[t.task_id]={x:cx,y:ty,left:nx,right:nx+NODE_W,agent:ag};
+
+          // Card
+          s+=`<rect x="${nx}" y="${ny}" width="${NODE_W}" height="${NODE_H}" rx="8"
+                 fill="${fc}" stroke="${sc}" stroke-width="1.5" filter="url(#shadow)"/>`;
+          // Left accent bar
+          s+=`<rect x="${nx}" y="${ny}" width="4" height="${NODE_H}" rx="8" fill="${sc}"/>`;
+          s+=`<rect x="${nx}" y="${ny+NODE_H/2}" width="4" height="${NODE_H/2}" rx="0" fill="${sc}"/>`;
+
+          // Activity name — main label
+          const label=(t.activity_name||t.task_id||'task');
+          const shortLabel=label.length>22?label.slice(0,21)+'…':label;
+          s+=`<text x="${nx+12}" y="${ny+17}" font-size="11" font-weight="600"
+                 fill="${tc}" dominant-baseline="middle">${shortLabel}</text>`;
+
+          // Sub-label: duration + status
+          const d=dur(t);
+          const statusMark=isErr?'✕ error':'✓';
+          const subText=`${statusMark}${d!==null?' · '+fmtD(d):''}`;
+          s+=`<text x="${nx+12}" y="${ny+31}" font-size="9.5" fill="${isErr?'#E24B4A':'#6B7280'}">${subText}</text>`;
+
+          // Task id (tiny, right-aligned) — only show if we have a real id
+          const rawId=t.task_id||t.activity_id||'';
+          const shortId=rawId.length>6?rawId.slice(-6):rawId;
+          if(shortId)s+=`<text x="${nx+NODE_W-8}" y="${ny+NODE_H-8}" font-size="8" fill="#9CA3AF"
+                 text-anchor="end">#${shortId}</text>`;
+        });
+      });
+
+      // ── Draw arrows ────────────────────────────────────────────────
+      // Same-agent sequential arrows (vertical, inside column)
+      orderedAgents.forEach(ag=>{
+        const ts=agentTasks[ag];
+        for(let i=0;i<ts.length-1;i++){
+          const a=pos[ts[i].task_id], b=pos[ts[i+1].task_id];
+          if(!a||!b)continue;
+          const x=a.x, y1=a.y+NODE_H/2+1, y2=b.y-NODE_H/2-1;
+          s+=`<line x1="${x}" y1="${y1}" x2="${x}" y2="${y2}"
+                stroke="${COLS[ag]||DEFAULT_COL}80" stroke-width="1.5"
+                stroke-dasharray="3 3" marker-end="url(#arr)"/>`;
+        }
+      });
+
+      // Cross-agent arrows: connect last task of each agent to first task of next agent
+      // Order agents by the earliest task start time in this run
+      const agentFirstStart={};
+      orderedAgents.forEach(ag=>{
+        const ts=agentTasks[ag];
+        agentFirstStart[ag]=ts.length?Math.min(...ts.map(t=>t.started_at||0)):Infinity;
+      });
+      const timeOrderedAgents=[...orderedAgents].sort((a,b)=>agentFirstStart[a]-agentFirstStart[b]);
+
+      for(let i=0;i<timeOrderedAgents.length-1;i++){
+        const srcAg=timeOrderedAgents[i], dstAg=timeOrderedAgents[i+1];
+        const srcTasks=agentTasks[srcAg], dstTasks=agentTasks[dstAg];
+        if(!srcTasks.length||!dstTasks.length)continue;
+        // Connect last task of source to first task of destination
+        const srcT=srcTasks[srcTasks.length-1], dstT=dstTasks[0];
+        const a=pos[srcT.task_id], b=pos[dstT.task_id];
+        if(!a||!b)continue;
+        const fromRight=a.x<b.x;
+        const x1=fromRight?a.right+2:a.left-2;
+        const x2=fromRight?b.left-2:b.right+2;
+        const y1=a.y, y2=b.y;
+        const mx=(x1+x2)/2;
+        s+=`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"
+              fill="none" stroke="${CROSS_ARROW_COL}" stroke-width="2.5"
+              marker-end="url(#arr-cross)"/>`;
+      }
+
+      // ── Legend ────────────────────────────────────────────────────
+      const legendY=H-26;
+      s+=`<circle cx="${COL_PAD+8}" cy="${legendY}" r="5" fill="#6B728050"/>`;
+      s+=`<line x1="${COL_PAD+3}" y1="${legendY}" x2="${COL_PAD+22}" y2="${legendY}" stroke="#6B728080" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+      s+=`<text x="${COL_PAD+26}" y="${legendY+4}" font-size="9" fill="#9CA3AF">sequential</text>`;
+      s+=`<line x1="${COL_PAD+100}" y1="${legendY}" x2="${COL_PAD+119}" y2="${legendY}" stroke="${CROSS_ARROW_COL}" stroke-width="2"/>`;
+      s+=`<text x="${COL_PAD+123}" y="${legendY+4}" font-size="9" fill="#9CA3AF">cross-agent handoff</text>`;
+      s+=`<text x="${W-COL_PAD}" y="${legendY+4}" font-size="9" fill="#9CA3AF" text-anchor="end">run ${_selectedRunIdx+1} of ${runs.length}</text>`;
+
+      svg.innerHTML=s;
+    }
+    async function loadWf(){
+      try{
+        const r=await fetch(restBase+'/api/v1/workflows');const d=await r.json();
+        const wfs=d.workflows||d||[];const el=document.getElementById('wf-list');
+        if(!wfs.length){el.innerHTML='<div class="empty"><i class="ti ti-sitemap"></i>No workflows found</div>';return;}
+        el.innerHTML=wfs.slice(0,15).map(w=>`<div class="wf-row">
+          <div style="font-weight:500">${w.workflow_id||w.name||'—'}</div>
+          <div style="color:var(--text2);font-size:11px">${w.task_count||'?'} tasks</div>
+          <div style="color:var(--text2);font-size:11px">${w.started_at?new Date(w.started_at*1000).toLocaleTimeString():'—'}</div>
+        </div>`).join('');
+      }catch(e){document.getElementById('wf-list').innerHTML='<div class="empty"><i class="ti ti-sitemap"></i>Could not load workflows</div>';}
+    }
+    function q(txt){document.getElementById('qin').value=txt;sendQ();}
+    async function sendQ(){
+      const inp=document.getElementById('qin');const qt=inp.value.trim();if(!qt)return;
+      inp.value='';const msgs=document.getElementById('msgs');
+      msgs.innerHTML+=`<div class="msg msg-user">${qt}</div>`;
+      msgs.innerHTML+=`<div class="msg msg-agent msg-loading" id="lmsg">Querying PROV-AGENT…</div>`;
+      msgs.scrollTop=msgs.scrollHeight;
+      try{
+        const r=await fetch(agentBase+'/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:qt})});
+        const data=await r.json();
+        let ans='';
+        if(typeof data==='string')ans=data;
+        else if(data.answer)ans=data.answer;
+        else if(data.result)ans=typeof data.result==='object'?JSON.stringify(data.result,null,2):data.result;
+        else if(data.error)ans='⚠ '+data.error;
+        else ans=JSON.stringify(data,null,2);
+        const lm=document.getElementById('lmsg');
+        const isMono=ans.startsWith('{')||ans.startsWith('[');
+        if(lm)lm.outerHTML=`<div class="msg msg-agent"><${isMono?'pre':'span'}>${ans.slice(0,1000)}</${isMono?'pre':'span'}></div>`;
+      }catch(e){
+        const lm=document.getElementById('lmsg');
+        if(lm)lm.outerHTML=`<div class="msg msg-agent">⚠ Cannot reach PROV-AGENT at ${agentBase}.<br>Run: <code>kubectl port-forward svc/flowcept-agent -n openlit-demo 8010:8000</code></div>`;
+      }
+      msgs.scrollTop=msgs.scrollHeight;
+    }
+    connect();
+    // Auto-refresh tasks every 10 seconds
+    setInterval(()=>{ if(document.getElementById('badge').className.includes('live')) refresh(); }, 10000);
+    </script>
+    </body>
+    </html>
+    
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowcept-ui
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowcept-ui
+  template:
+    metadata:
+      labels:
+        app: flowcept-ui
+    spec:
+      containers:
+        - name: flowcept-ui
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              mkdir -p /app &&
+              cp /html/index.html /app/index.html &&
+              cd /app &&
+              python3 -m http.server 8020
+          ports:
+            - name: ui
+              containerPort: 8020
+          volumeMounts:
+            - name: html
+              mountPath: /html
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+      volumes:
+        - name: html
+          configMap:
+            name: flowcept-ui-html
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowcept-ui
+  namespace: openlit-demo
+spec:
+  selector:
+    app: flowcept-ui
+  ports:
+    - name: ui
+      port: 8020
+      targetPort: 8020
+      
+      
+      
+---
+# =============================================================================
+# Ollama — local LLM inference server, pre-pulls tinyllama on startup
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: openlit-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # robopaas: A30 GPU via runtime class (the cluster's nvidia device plugin
+      # registers no nvidia.com/gpu resources, so GPU access goes through the
+      # runtime class + NVIDIA_VISIBLE_DEVICES, pinned to an idle GPU node; gpu-6 is taint-reserved, gpu-3 is the idle untainted one)
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: gpu-3
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - name: http
+          containerPort: 11434
+        env:
+          - name: NVIDIA_VISIBLE_DEVICES
+            value: "all"
+          - name: NVIDIA_DRIVER_CAPABILITIES
+            value: "compute,utility"
+          # Cap default context so qwen2.5:32b (19GB weights) fits the 24GB
+          # A30 fully on GPU; with the model-default 32k ctx it needs 28GB and
+          # spills to CPU (0.9 tok/s instead of 24 tok/s).
+          - name: OLLAMA_CONTEXT_LENGTH
+            value: "4096"
+        # postStart pulls tinyllama immediately; mistral is pulled on demand
+        # Models persist in the ollama-models PVC — survive pod restarts
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5 && ollama pull tinyllama"]
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "24Gi"
+            cpu: "8000m"
+        volumeMounts:
+          - name: ollama-models
+            mountPath: /root/.ollama
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: ollama-models
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: openlit-demo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # local-path is the default SC on robopaas too; WaitForFirstConsumer binds
+  # the volume on the node where the ollama pod is pinned (gpu-3).
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 80Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: openlit-demo
+spec:
+  selector:
+    app: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: 11434
+
+# =============================================================================
+# SETUP GUIDE
+# =============================================================================
+#
+# ── LANGFUSE (deploy separately via Helm) ────────────────────────────────────
+# 1. Add Helm repo:
+#    helm repo add langfuse https://langfuse.github.io/langfuse-k8s
+#    helm repo update
+#
+# 2. Deploy using the provided values file:
+#    helm install langfuse langfuse/langfuse -n langfuse --create-namespace \
+#      -f langfuse-storage-values.yaml
+#
+# 3. Generate Langfuse API keys:
+#    - Port-forward:  kubectl port-forward svc/langfuse-web -n langfuse 3002:3000
+#    - Open:          http://localhost:3002
+#    - Settings → API Keys → Create new key pair (pk-lf-... / sk-lf-...)
+#    - Encode:        echo -n "pk-lf-XXX:sk-lf-YYY" | base64
+#    - Paste the result into the Authorization header of otlphttp/langfuse
+#      in the otel-collector-config ConfigMap above, then redeploy.
+#
+# ── OPENLIT (deploy separately via Helm) ─────────────────────────────────────
+# 1. helm repo add openlit https://helm.openlit.ai && helm repo update
+# 2. helm install openlit openlit/openlit -n openlit --create-namespace
+#
+# ── FLOWCEPT PROVENANCE DASHBOARD ────────────────────────────────────────────
+# The Flowcept UI at http://localhost:8020 connects to the REST API at
+# http://localhost:5000/api/v1 (flowcept-rest) and the PROV-AGENT query
+# endpoint at http://localhost:5000 (flowcept-agent).
+#
+# Both are already wired in the UI defaults — just click Connect.
+#
+# Run selector: each curl http://localhost:8080/run generates a unique
+# run_id (uuid) that is stamped as workflow_id on all 4 task records.
+# The Prov graph groups records by workflow_id so each run is selectable
+# independently. Up to 5 recent runs are shown in the selector.
+#
+# Clear provenance data:
+#   kubectl exec -n openlit-demo deployment/flowcept-mongodb -- \
+#     mongosh flowcept --eval "db.tasks.drop()"
+#   Or use the trash icon in the Flowcept UI header.
+# =============================================================================

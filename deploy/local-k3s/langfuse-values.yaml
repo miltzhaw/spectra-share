@@ -1,0 +1,27 @@
+langfuse:
+  salt:
+    value: "${LANGFUSE_SALT}"
+  nextauth:
+    secret:
+      value: "${NEXTAUTH_SECRET}"
+    url: "http://localhost:3002"
+
+postgresql:
+  auth:
+    password: "${DB_PASSWORD}"
+  primary:
+    persistence:
+      storageClass: "local-path"
+
+clickhouse:
+  auth:
+    password: "${DB_PASSWORD}"
+  persistence:
+    storageClass: "local-path"
+
+redis:
+  auth:
+    password: "${DB_PASSWORD}"
+  master:
+    persistence:
+      storageClass: "local-path"
